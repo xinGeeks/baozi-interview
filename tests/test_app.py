@@ -191,3 +191,42 @@ def test_llm_error_during_start_shows_error(configure_llm, monkeypatch):
     assert any("LLM" in e or "网络" in e for e in errors), (
         f"期望出现 LLM 错误提示,实际 errors: {errors}"
     )
+
+
+# ============================================================================
+# 简历提取预览(v0.3 UX)
+# ============================================================================
+
+def test_resume_preview_expander_shows_content(configure_llm):
+    """上传简历后,sidebar 应出现 expander 含简历全文。"""
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    # 直接灌 session_state 模拟已上传简历(绕开 file_uploader)
+    at.session_state["resume_content"] = (
+        "张三 5年 Python 后端 熟悉 FastAPI * 微服务 _ 高并发"
+    )
+    at.run()
+
+    # expander 应出现且标签含"简历"和字数
+    expanders = [e for e in at.sidebar.expander if "简历" in (e.label or "")]
+    assert len(expanders) == 1, f"期望 1 个简历 expander,实际 {len(expanders)} 个"
+    assert "字" in expanders[0].label
+    # text_area 内容应含简历关键字(且 markdown 特殊字符不被吃)
+    ta_values = [t.value for t in at.sidebar.text_area]
+    assert any("张三" in v and "Python" in v for v in ta_values), (
+        f"text_area 缺少简历关键字,实际: {ta_values}"
+    )
+    # markdown 特殊字符完整保留
+    assert any("*" in v and "_" in v for v in ta_values), (
+        "text_area 应完整保留 markdown 特殊字符(不被渲染)"
+    )
+
+
+def test_no_resume_preview_when_empty(configure_llm):
+    """未上传简历时,不应出现简历预览 expander。"""
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    at.session_state["resume_content"] = ""
+    at.run()
+    expanders = [e for e in at.sidebar.expander if "简历" in (e.label or "")]
+    assert len(expanders) == 0

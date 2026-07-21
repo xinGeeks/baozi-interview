@@ -105,7 +105,17 @@ with st.sidebar:
     )
 
     if st.session_state.resume_content:
-        st.caption(f"📄 简历已加载 ({len(st.session_state.resume_content)} 字)")
+        with st.expander(
+            f"👀 简历提取预览 ({len(st.session_state.resume_content)} 字)",
+            expanded=False,
+        ):
+            st.text_area(
+                "简历内容",
+                value=st.session_state.resume_content,
+                height=300,
+                disabled=True,
+                label_visibility="collapsed",
+            )
     else:
         st.caption("📄 暂未上传简历")
 

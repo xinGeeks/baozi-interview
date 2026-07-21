@@ -9,13 +9,24 @@ from config import DEFAULT_BASE_URL, DEFAULT_MODEL, LLMConfig, get_llm_config
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    """每个测试清空 LLM_* 变量,避免宿主环境污染。"""
+    """每个测试清空 LLM_* 变量,避免宿主 env 污染。
+
+    .env 加载不在此禁,因为有测试显式要测 .env 行为;
+    测"默认值"的测试自己用 _no_dotenv fixture 显式禁。
+    """
     for key in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
         monkeypatch.delenv(key, raising=False)
     yield
 
 
-def test_get_llm_config_all_defaults():
+@pytest.fixture
+def no_dotenv(monkeypatch):
+    """禁用 .env 加载,用于测"完全无配置"场景。"""
+    import config as _config_mod
+    monkeypatch.setattr(_config_mod, "_load_dotenv", lambda path: None)
+
+
+def test_get_llm_config_all_defaults(no_dotenv):
     cfg = get_llm_config()
     assert cfg.api_key == ""
     assert cfg.base_url == DEFAULT_BASE_URL
