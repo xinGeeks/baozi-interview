@@ -169,3 +169,62 @@ def test_style_focus_covers_all_styles():
 def test_six_levels_unique():
     assert len(LEVELS) == 6
     assert len(set(LEVELS)) == 6  # 无重复
+
+
+# ============================================================================
+# v0.3 Feature A:turn_feedback 联动报告段
+# ============================================================================
+
+def test_report_prompt_includes_turn_feedback_table():
+    """传 turn_feedback 时,prompt 应包含『逐轮评分』表格段。"""
+    feedback = [
+        {"question": "自我介绍", "score": 7, "advice": "缺数据"},
+        {"question": "讲讲项目", "score": 5, "advice": "模糊"},
+    ]
+    prompt = build_report_prompt(
+        level="社招(中级)",
+        resume="r",
+        jd="j",
+        chat_history=[
+            {"role": "assistant", "content": "q1"},
+            {"role": "user", "content": "a1"},
+        ],
+        turn_feedback=feedback,
+    )
+    assert "逐轮评分" in prompt
+    assert "| 轮次 |" in prompt  # markdown 表头
+    assert "| 1 |" in prompt
+    assert "| 2 |" in prompt
+    assert "7/10" in prompt
+    assert "5/10" in prompt
+    assert "缺数据" in prompt
+    assert "天花板" in prompt  # 反虚高锚点说明
+
+
+def test_report_prompt_without_feedback_omits_section():
+    """不传 turn_feedback(向后兼容),prompt 不含逐轮评分段。"""
+    prompt = build_report_prompt(
+        level="校招",
+        resume="r",
+        jd="j",
+        chat_history=[],
+    )
+    assert "逐轮评分" not in prompt
+
+    prompt_with_none = build_report_prompt(
+        level="校招",
+        resume="r",
+        jd="j",
+        chat_history=[],
+        turn_feedback=None,
+    )
+    assert "逐轮评分" not in prompt_with_none
+
+    prompt_with_empty = build_report_prompt(
+        level="校招",
+        resume="r",
+        jd="j",
+        chat_history=[],
+        turn_feedback=[],
+    )
+    assert "逐轮评分" not in prompt_with_empty

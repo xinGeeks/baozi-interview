@@ -313,3 +313,138 @@ def test_chat_history_without_think_no_expander(configure_llm):
     at.run()
     think_expanders = [e for e in at.expander if "思考" in (e.label or "")]
     assert len(think_expanders) == 0
+
+
+# ============================================================================
+# v0.3 Feature A:每轮即时反馈
+# ============================================================================
+
+def test_feedback_card_appears_after_user_message(configure_llm):
+    """跑 2 轮对话,每轮 user message 后应出现反馈小卡。"""
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    # 主对话 3 个 mock(开场 + 2 个追问)+ 2 个反馈 mock
+    at.session_state["mock_responses"] = [
+        "请介绍一下你自己",
+        "做过最有挑战的项目是?",
+        "团队规模和你的具体职责?",
+    ]
+    at.session_state["mock_feedback_responses"] = [
+        "【分数】7/10\n【建议】回答里有项目但缺数据,补一个量化数字。",
+        "【分数】5/10\n【建议】描述模糊,具体说说你负责的模块。",
+    ]
+    at.text_area[0].set_value("Python 后端 JD")
+    at.run()
+
+    start_btn = _find_button(at, lambda l: "开始面试" in l and "重新" not in l)
+    start_btn.click()
+    at.run()
+
+    # 第 1 轮
+    at.chat_input[0].set_value("我做电商订单系统 5 年")
+    at.run()
+
+    # 第 2 轮
+    at.chat_input[0].set_value("团队 8 人,我负责订单核心模块")
+    at.run()
+
+    # 两轮反馈应进入队列
+    assert len(at.session_state["turn_feedback"]) == 2
+    assert at.session_state["turn_feedback"][0]["score"] == 7
+    assert "量化" in at.session_state["turn_feedback"][0]["advice"]
+    assert at.session_state["turn_feedback"][1]["score"] == 5
+
+    # 渲染层:HTML 卡片 div 含分数和建议
+    html_md = "\n".join(m.value for m in at.markdown)
+    assert "7/10" in html_md
+    assert "5/10" in html_md
+    assert "📊" in html_md
+
+
+def test_feedback_failure_does_not_break_interview(configure_llm, monkeypatch):
+    """反馈 LLM 抛错时,主对话下一题仍正常生成。"""
+    import streamlit as st
+    from llm import LLMError
+
+    def selective_chat(messages, *, temperature=0.7, purpose="chat"):
+        if purpose == "feedback":
+            raise LLMError("反馈服务挂了")
+        mock_q = st.session_state.get("mock_responses")
+        if isinstance(mock_q, list) and mock_q:
+            return mock_q.pop(0)
+        return ""
+
+    monkeypatch.setattr("app._do_chat", selective_chat)
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    at.session_state["mock_responses"] = ["开场问题", "追问"]
+    at.text_area[0].set_value("JD")
+    at.run()
+
+    start_btn = _find_button(at, lambda l: "开始面试" in l and "重新" not in l)
+    start_btn.click()
+    at.run()
+
+    at.chat_input[0].set_value("我的回答")
+    at.run()
+
+    # 反馈失败被吞,但 turn_feedback 应有 score=-1 占位
+    assert len(at.session_state["turn_feedback"]) == 1
+    assert at.session_state["turn_feedback"][0]["score"] == -1
+
+    # 主对话下一题应出现
+    history = at.session_state["chat_history"]
+    last_msg = history[-1]
+    assert last_msg["role"] == "assistant"
+    assert last_msg["content"]  # 非空
+
+    # 错误信息不应展示(因为我们吞了 LLMError)
+    assert not at.error
+
+
+def test_turn_feedback_passed_to_report_prompt(configure_llm, monkeypatch):
+    """结束面试时,turn_feedback 应透传给 build_report_prompt。
+
+    注意:monkeypatch `app.build_report_prompt` 不稳(Streamlit rerun 重新
+    执行 from prompts import ... 会覆盖 patch);改 patch 源模块 prompts。
+    """
+    captured = {}
+
+    def fake_report_prompt(*args, **kwargs):
+        captured["turn_feedback"] = kwargs.get("turn_feedback")
+        captured["called"] = True
+        return "REPORT_PROMPT_STUB"
+
+    monkeypatch.setattr("prompts.build_report_prompt", fake_report_prompt)
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    at.session_state["mock_responses"] = [
+        "开场", "追问", "## 复盘报告"
+    ]
+    at.session_state["mock_feedback_responses"] = [
+        "【分数】8/10\n【建议】不错。",
+        "【分数】6/10\n【建议】再具体。",
+    ]
+    at.text_area[0].set_value("JD")
+    at.run()
+
+    start_btn = _find_button(at, lambda l: "开始面试" in l and "重新" not in l)
+    start_btn.click()
+    at.run()
+    at.chat_input[0].set_value("answer 1")
+    at.run()
+    at.chat_input[0].set_value("answer 2")
+    at.run()
+
+    end_btn = _find_button(at, lambda l: "结束面试" in l and "开始" not in l)
+    end_btn.click()
+    at.run()
+
+    assert captured.get("called") is True
+    tf = captured.get("turn_feedback")
+    assert tf is not None
+    assert len(tf) == 2
+    assert tf[0]["score"] == 8
+    assert tf[1]["score"] == 6

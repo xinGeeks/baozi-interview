@@ -158,6 +158,7 @@ def build_report_prompt(
     resume: str,
     jd: str,
     chat_history: list[dict],
+    turn_feedback: list[dict] | None = None,
 ) -> str:
     """构造报告生成的 user prompt(报告本身用单次 user 调用生成,无 system)。
 
@@ -166,6 +167,9 @@ def build_report_prompt(
         resume: 简历文本
         jd: 岗位 JD
         chat_history: [{"role": "user|assistant", "content": "..."}, ...]
+        turn_feedback: 每轮即时反馈(可选),元素格式
+            {"question": str, "score": int, "advice": str}。
+            None 或空列表时该段在 prompt 中省略(向后兼容)。
     """
     if level not in LEVELS:
         raise ValueError(f"未知职级:{level!r}")
@@ -175,6 +179,31 @@ def build_report_prompt(
         role = "候选人" if msg["role"] == "user" else "面试官"
         transcript_lines.append(f"[{role}]: {msg['content']}")
     transcript = "\n\n".join(transcript_lines)
+
+    turn_feedback_section = ""
+    if turn_feedback:
+        rows = [
+            "| 轮次 | 问题摘要 | 分数 | 一句话建议 |",
+            "|---|---|---|---|",
+        ]
+        for i, fb in enumerate(turn_feedback, 1):
+            q = (fb.get("question") or "").replace("|", "/").replace("\n", " ")
+            score = fb.get("score", -1)
+            score_cell = f"{score}/10" if score >= 0 else "—"
+            advice = (fb.get("advice") or "").replace("|", "/").replace("\n", " ")
+            rows.append(f"| {i} | {q} | {score_cell} | {advice} |")
+        turn_feedback_block = "\n".join(rows)
+        turn_feedback_section = f"""
+## 逐轮评分(由系统在每轮对话后即时生成,作为打分锚点)
+
+{turn_feedback_block}
+
+要求:
+- 报告的【六维度打分】必须与逐轮分数保持合理一致:如果多轮平均偏低,
+  六维里不应出现明显的 9 分单维度(整体天花板 ≈ 轮次均分 + 1.5)。
+- 逐轮分数作为锚点用于反虚高;但报告维度(沟通/逻辑/匹配)可以比纯轮次分
+  略高/略低,只要在硬约束 #3 范围内。
+"""
 
     return f"""你是一位经验丰富的【面试教练】,根据以下完整的模拟面试记录,给求职者写一份**复盘报告**。
 
@@ -187,7 +216,7 @@ def build_report_prompt(
 
 【完整面试对话记录】:
 {transcript}
-
+{turn_feedback_section}
 ---
 
 ## 报告必须遵守的硬约束

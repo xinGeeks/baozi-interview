@@ -9,6 +9,7 @@ import re
 import streamlit as st
 
 from config import get_llm_config
+from feedback import build_feedback_prompt, parse_feedback_response
 from llm import LLMError, chat
 from prompts import (
     END_SIGNAL,
@@ -41,16 +42,23 @@ def _split_think_blocks(content: str) -> tuple[list[str], str]:
 _chat_impl = chat
 
 
-def _do_chat(messages, **kwargs):
+def _do_chat(messages, *, temperature=0.7, purpose="chat"):
     """调用 LLM。
 
-    测试注入点:如果 st.session_state["mock_responses"] 存在,优先从该队列取响应;
-    否则调真实 LLM。streamlit rerun 不会丢失 session_state,所以这是稳定的测试 hook。
+    测试注入点:
+    - purpose="chat"(默认):如果 st.session_state["mock_responses"] 存在,
+      优先从该队列取响应。
+    - purpose="feedback":如果 st.session_state["mock_feedback_responses"] 存在,
+      优先从该队列取响应。
+    streamlit rerun 不会丢失 session_state,所以这是稳定的测试 hook。
     """
-    mock_q = st.session_state.get("mock_responses")
+    if purpose == "feedback":
+        mock_q = st.session_state.get("mock_feedback_responses")
+    else:
+        mock_q = st.session_state.get("mock_responses")
     if isinstance(mock_q, list) and mock_q:
         return mock_q.pop(0)
-    return _chat_impl(messages, **kwargs)
+    return _chat_impl(messages, temperature=temperature)
 
 
 # ============================================================================
@@ -81,6 +89,7 @@ DEFAULTS = {
     "interview_ended": False,
     "report_text": "",
     "error_msg": "",
+    "turn_feedback": [],  # 每答一题追加一次:[{"question", "score", "advice"}, ...]
     # 测试 hook:如果 setdefault 时已存在(mock_responses 不在 DEFAULTS 但 setdefault 不会创建),
     # 保留测试设置。Streamlit 每次 rerun 都会重新执行模块顶层,所以测试需要用
     # at.session_state[...] 显式注入(在 at.run() 之前或之后第一次 set_state)。
@@ -175,6 +184,7 @@ def _start_interview() -> None:
         st.session_state.error_msg = "请先粘贴 JD 再开始面试"
         return
     st.session_state.chat_history = []
+    st.session_state.turn_feedback = []
     st.session_state.interview_started = True
     st.session_state.interview_ended = False
     st.session_state.report_text = ""
@@ -194,8 +204,41 @@ def _start_interview() -> None:
 
 
 def _handle_user_answer(answer: str) -> None:
-    """用户提交回答:追加到 history + 生成下一题。"""
+    """用户提交回答:追加到 history → 逐轮反馈 → 生成下一题。"""
     st.session_state.chat_history.append({"role": "user", "content": answer})
+
+    last_question = ""
+    for msg in reversed(st.session_state.chat_history):
+        if msg["role"] == "assistant":
+            last_question = msg["content"]
+            break
+
+    # 逐轮反馈(失败不中断面试:记 score=-1,渲染层不显示卡片)
+    try:
+        feedback_messages = [{
+            "role": "user",
+            "content": build_feedback_prompt(
+                level=st.session_state.interview_level,
+                question=last_question,
+                answer=answer,
+            ),
+        }]
+        feedback_raw = _do_chat(
+            feedback_messages, temperature=0.3, purpose="feedback"
+        )
+        parsed = parse_feedback_response(feedback_raw)
+        st.session_state.turn_feedback.append({
+            "question": last_question[:60],
+            "score": parsed["score"],
+            "advice": parsed["advice"],
+        })
+    except LLMError:
+        st.session_state.turn_feedback.append({
+            "question": last_question[:60],
+            "score": -1,
+            "advice": "",
+        })
+
     messages = [{"role": "system", "content": _system_prompt()}] + list(
         st.session_state.chat_history
     )
@@ -205,6 +248,16 @@ def _handle_user_answer(answer: str) -> None:
         st.session_state.error_msg = str(e)
         return
     st.session_state.chat_history.append({"role": "assistant", "content": next_q})
+
+
+def _render_feedback_card(fb: dict) -> None:
+    """渲染反馈小卡:📊 N/10 — advice(浅灰底,单行)。"""
+    advice = (fb.get("advice") or "").replace("<", "&lt;").replace(">", "&gt;")
+    st.markdown(
+        f"<div style='background:#f0f2f6;padding:6px 10px;border-radius:6px;"
+        f"font-size:0.85em;color:#333'>📊 <b>{fb['score']}/10</b> — {advice}</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _generate_report() -> None:
@@ -217,6 +270,7 @@ def _generate_report() -> None:
         resume=st.session_state.resume_content,
         jd=st.session_state.jd_content,
         chat_history=list(st.session_state.chat_history),
+        turn_feedback=list(st.session_state.turn_feedback),
     )
     try:
         report = _do_chat([{"role": "user", "content": prompt}], temperature=0.4)
@@ -287,7 +341,8 @@ st.subheader("💬 面试对话")
 if not st.session_state.chat_history:
     st.info("👈 配置好简历 / JD / 等级后,点『开始面试』即可。")
 else:
-    for msg in st.session_state.chat_history:
+    user_msg_seen = 0
+    for idx, msg in enumerate(st.session_state.chat_history):
         if msg["role"] == "assistant":
             with st.chat_message("assistant", avatar="👨‍🏫"):
                 thinks, visible = _split_think_blocks(msg["content"])
@@ -305,6 +360,12 @@ else:
         else:
             with st.chat_message("user", avatar="🙋"):
                 st.markdown(msg["content"])
+            # 反馈卡(单行小卡;score=-1 表示本轮无反馈,不渲染)
+            if user_msg_seen < len(st.session_state.turn_feedback):
+                fb = st.session_state.turn_feedback[user_msg_seen]
+                if fb.get("score", -1) >= 0:
+                    _render_feedback_card(fb)
+            user_msg_seen += 1
 
 
 # ============================================================================
