@@ -230,3 +230,86 @@ def test_no_resume_preview_when_empty(configure_llm):
     at.run()
     expanders = [e for e in at.sidebar.expander if "简历" in (e.label or "")]
     assert len(expanders) == 0
+
+
+# ============================================================================
+# Think 块折叠(v0.3 UX)
+# ============================================================================
+
+class TestSplitThinkBlocks:
+    """_split_think_blocks 纯函数测试。"""
+
+    def test_no_think_block(self):
+        from app import _split_think_blocks
+        thinks, visible = _split_think_blocks("你好,我是回答")
+        assert thinks == []
+        assert visible == "你好,我是回答"
+
+    def test_single_think_block_at_start(self):
+        from app import _split_think_blocks
+        content = "<think>我在思考怎么回答</think>\n\n正式回答"
+        thinks, visible = _split_think_blocks(content)
+        assert len(thinks) == 1
+        assert "我在思考怎么回答" in thinks[0]
+        assert visible == "正式回答"
+
+    def test_multiple_think_blocks(self):
+        from app import _split_think_blocks
+        content = "<think>第一段思考</think>中段可见<think>第二段思考</think>"
+        thinks, visible = _split_think_blocks(content)
+        assert len(thinks) == 2
+        assert "第一段" in thinks[0]
+        assert "第二段" in thinks[1]
+        assert "中段可见" in visible
+
+    def test_think_with_multiline(self):
+        from app import _split_think_blocks
+        content = "<think>第一行\n第二行\n第三行</think>\n\n回答"
+        thinks, visible = _split_think_blocks(content)
+        assert len(thinks) == 1
+        assert "第一行" in thinks[0]
+        assert "第二行" in thinks[0]
+        assert "第三行" in thinks[0]
+        assert visible == "回答"
+
+    def test_think_only_no_visible(self):
+        from app import _split_think_blocks
+        thinks, visible = _split_think_blocks("<think>只有思考</think>")
+        assert len(thinks) == 1
+        assert visible == ""
+
+
+def test_chat_history_with_think_shows_expander(configure_llm):
+    """chat_history 含 <think> 块时,渲染应出现折叠 expander。"""
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    at.session_state["chat_history"] = [
+        {"role": "user", "content": "自我介绍"},
+        {
+            "role": "assistant",
+            "content": "<think>他在让我自我介绍,我要问项目</think>\n\n请介绍一下你自己和最有挑战的项目",
+        },
+    ]
+    at.run()
+
+    # 应出现"思考过程"expander
+    think_expanders = [e for e in at.expander if "思考" in (e.label or "")]
+    assert len(think_expanders) == 1
+    # visible 部分仍渲染
+    md = "\n".join(m.value for m in at.markdown)
+    assert "请介绍一下你自己" in md
+    # 思考内容不应在 markdown 里(在 expander 里)
+    assert "我在思考" not in md or "思考过程" in md  # 思考被 expander 收纳
+
+
+def test_chat_history_without_think_no_expander(configure_llm):
+    """chat_history 无 <think> 时,不应出现思考 expander。"""
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    at.session_state["chat_history"] = [
+        {"role": "user", "content": "自我介绍"},
+        {"role": "assistant", "content": "请介绍一下你自己"},
+    ]
+    at.run()
+    think_expanders = [e for e in at.expander if "思考" in (e.label or "")]
+    assert len(think_expanders) == 0

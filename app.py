@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import re
+
 import streamlit as st
 
 from config import get_llm_config
@@ -16,6 +18,20 @@ from prompts import (
     build_report_prompt,
 )
 from resume_parser import ResumeParseError, parse_pdf_resume
+
+
+THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def _split_think_blocks(content: str) -> tuple[list[str], str]:
+    """把 <think>...</think> 块从 LLM 输出中拆出来。
+
+    Returns:
+        (think_blocks, visible_content): 块列表 + 移除 think 后的可见内容(已 strip)
+    """
+    thinks = THINK_RE.findall(content)
+    visible = THINK_RE.sub("", content).strip()
+    return thinks, visible
 
 
 # 测试 hook:monkeypatch app._do_chat 来替换 LLM。
@@ -274,7 +290,18 @@ else:
     for msg in st.session_state.chat_history:
         if msg["role"] == "assistant":
             with st.chat_message("assistant", avatar="👨‍🏫"):
-                st.markdown(msg["content"])
+                thinks, visible = _split_think_blocks(msg["content"])
+                if thinks:
+                    with st.expander(
+                        f"🧠 思考过程 ({len(thinks)} 块)", expanded=False
+                    ):
+                        for i, t in enumerate(thinks, 1):
+                            if len(thinks) > 1:
+                                st.markdown(f"**块 {i}**\n\n{t.strip()}")
+                            else:
+                                st.markdown(t.strip())
+                if visible:
+                    st.markdown(visible)
         else:
             with st.chat_message("user", avatar="🙋"):
                 st.markdown(msg["content"])
