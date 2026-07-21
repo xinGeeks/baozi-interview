@@ -1,0 +1,307 @@
+"""storage.py 单元测试。
+
+所有测试用 tmp_path 注入独立 DB,不污染生产 data/interviews.db。
+"""
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from storage import (
+    DEFAULT_DB_PATH,
+    candidate_id_from_resume,
+    get_session,
+    init_db,
+    list_sessions,
+    save_session,
+)
+
+
+# ============================================================================
+# Fixtures
+# ============================================================================
+
+@pytest.fixture
+def db(tmp_path: Path) -> Path:
+    """每个测试用 tmp_path 内的 test.db。"""
+    p = tmp_path / "test.db"
+    init_db(p)
+    return p
+
+
+def _sample_history() -> tuple[list[dict], list[dict], str]:
+    """一组典型的 (chat_history, turn_feedback, report_text)。"""
+    chat = [
+        {"role": "assistant", "content": "请介绍一下你自己"},
+        {"role": "user", "content": "我做 Python 后端 5 年"},
+        {"role": "assistant", "content": "讲讲最有挑战的项目"},
+        {"role": "user", "content": "电商订单系统,峰值 QPS 5000"},
+    ]
+    feedback = [
+        {"question": "请介绍一下你自己", "score": 7, "advice": "缺数据"},
+        {"question": "讲讲最有挑战的项目", "score": 5, "advice": "模糊"},
+    ]
+    report = "## 复盘报告\n1. 岗位匹配度:7/10 ..."
+    return chat, feedback, report
+
+
+# ============================================================================
+# init_db
+# ============================================================================
+
+def test_init_db_creates_tables(db: Path):
+    with sqlite3.connect(str(db)) as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+    table_names = {r[0] for r in rows}
+    assert "interview_sessions" in table_names
+    assert "interview_turns" in table_names
+    assert "turn_feedback" in table_names
+
+
+def test_init_db_is_idempotent(tmp_path: Path):
+    p = tmp_path / "test.db"
+    init_db(p)
+    init_db(p)  # 第二次不应抛错
+    assert p.exists()
+
+
+# ============================================================================
+# candidate_id_from_resume
+# ============================================================================
+
+def test_candidate_id_from_empty_resume_returns_default():
+    assert candidate_id_from_resume("") == "default"
+    assert candidate_id_from_resume("   ") == "default"
+    assert candidate_id_from_resume(None or "") == "default"
+
+
+def test_candidate_id_from_resume_is_deterministic():
+    a = candidate_id_from_resume("张三 5年 Python 后端")
+    b = candidate_id_from_resume("张三 5年 Python 后端")
+    assert a == b
+    assert a.startswith("c_")
+
+
+def test_candidate_id_differs_for_different_resumes():
+    a = candidate_id_from_resume("简历 A")
+    b = candidate_id_from_resume("简历 B")
+    assert a != b
+
+
+# ============================================================================
+# save_session + get_session roundtrip
+# ============================================================================
+
+def test_save_and_get_session_roundtrip(db: Path):
+    chat, feedback, report = _sample_history()
+    sid = save_session(
+        db_path=db,
+        level="社招(中级)",
+        style="温和引导",
+        jd="Python 后端 JD 内容" * 20,  # 长 JD,验证摘要
+        resume_text="张三 5年 Python 后端",
+        chat_history=chat,
+        turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime(2026, 7, 21, 10, 0, 0, tzinfo=timezone.utc),
+    )
+
+    sess = get_session(db, sid)
+    assert sess is not None
+    assert sess["id"] == sid
+    assert sess["level"] == "社招(中级)"
+    assert sess["style"] == "温和引导"
+    assert sess["report_text"] == report
+    assert sess["turn_count"] == 2  # user 消息数
+    assert sess["score_avg"] == pytest.approx(6.0)
+    assert len(sess["turns"]) == 4
+    assert sess["turns"][0]["role"] == "assistant"
+    assert sess["turns"][1]["content"] == "我做 Python 后端 5 年"
+    assert len(sess["feedback"]) == 2
+    assert sess["feedback"][0]["score"] == 7
+
+
+def test_save_session_generates_unique_id(db: Path):
+    chat, feedback, report = _sample_history()
+    sid1 = save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd="j", resume_text="r",
+        chat_history=chat, turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+    )
+    sid2 = save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd="j", resume_text="r",
+        chat_history=chat, turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+    )
+    assert sid1 != sid2
+
+
+# ============================================================================
+# score_avg 边界
+# ============================================================================
+
+def test_save_session_score_avg_handles_no_feedback(db: Path):
+    chat, _, report = _sample_history()
+    sid = save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd="j", resume_text="r",
+        chat_history=chat, turn_feedback=[],
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+    )
+    sess = get_session(db, sid)
+    assert sess["score_avg"] is None
+
+
+def test_save_session_score_avg_ignores_negative_scores(db: Path):
+    chat, _, report = _sample_history()
+    feedback = [
+        {"question": "q1", "score": 8, "advice": "ok"},
+        {"question": "q2", "score": -1, "advice": ""},  # 反馈失败占位
+        {"question": "q3", "score": 6, "advice": "可改"},
+    ]
+    sid = save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd="j", resume_text="r",
+        chat_history=chat, turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+    )
+    sess = get_session(db, sid)
+    # 8 + 6 / 2 = 7.0(忽略 -1)
+    assert sess["score_avg"] == pytest.approx(7.0)
+
+
+# ============================================================================
+# list_sessions
+# ============================================================================
+
+def test_list_sessions_orders_by_ended_at_desc(db: Path):
+    chat, feedback, report = _sample_history()
+    sid_old = save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd="j", resume_text="",  # 空简历 → candidate_id="default"
+        chat_history=chat, turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc),
+    )
+    sid_new = save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd="j", resume_text="",
+        chat_history=chat, turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime(2026, 7, 21, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 7, 21, 12, 0, 0, tzinfo=timezone.utc),
+    )
+
+    sessions = list_sessions(db, "default")
+    assert len(sessions) == 2
+    # 倒序:新的在前
+    assert sessions[0]["id"] == sid_new
+    assert sessions[1]["id"] == sid_old
+
+
+def test_list_sessions_filters_by_candidate(db: Path):
+    chat, feedback, report = _sample_history()
+    save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd="j", resume_text="简历 A",
+        chat_history=chat, turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+    )
+    save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd="j", resume_text="简历 B",
+        chat_history=chat, turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+    )
+
+    a_sessions = list_sessions(db, candidate_id_from_resume("简历 A"))
+    b_sessions = list_sessions(db, candidate_id_from_resume("简历 B"))
+    assert len(a_sessions) == 1
+    assert len(b_sessions) == 1
+    assert a_sessions[0]["id"] != b_sessions[0]["id"]
+
+
+def test_list_sessions_respects_limit(db: Path):
+    chat, feedback, report = _sample_history()
+    for i in range(7):
+        save_session(
+            db_path=db, level="校招", style="温和引导",
+            jd="j", resume_text="",  # 空简历 → "default" candidate
+            chat_history=chat, turn_feedback=feedback,
+            report_text=report,
+            started_at=datetime(2026, 7, i + 1, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 7, i + 1, 12, 0, 0, tzinfo=timezone.utc),
+        )
+    sessions = list_sessions(db, "default", limit=5)
+    assert len(sessions) == 5
+
+
+# ============================================================================
+# get_session 边界
+# ============================================================================
+
+def test_get_session_returns_none_for_missing(db: Path):
+    assert get_session(db, "nonexistent") is None
+
+
+# ============================================================================
+# PII 安全
+# ============================================================================
+
+def test_no_resume_text_in_db(db: Path):
+    chat, feedback, report = _sample_history()
+    pii_marker = "张三_身份证_110101199001011234_PII_SECRET"
+    save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd="j", resume_text=pii_marker + " 简历其余内容",
+        chat_history=chat, turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+    )
+
+    # 全文扫描 DB,确认 PII marker 不在
+    with sqlite3.connect(str(db)) as conn:
+        all_text = ""
+        for table in ("interview_sessions", "interview_turns", "turn_feedback"):
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            for r in rows:
+                all_text += str(r) + "\n"
+    assert pii_marker not in all_text, "DB 不应存简历原文"
+
+
+def test_jd_summary_truncated_to_200_chars(db: Path):
+    chat, feedback, report = _sample_history()
+    long_jd = "X" * 500
+    sid = save_session(
+        db_path=db, level="校招", style="温和引导",
+        jd=long_jd, resume_text="r",
+        chat_history=chat, turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+    )
+    sess = get_session(db, sid)
+    # jd_summary ≤ 200 字(以 … 结尾或原长 <200)
+    assert len(sess["jd_summary"]) <= 201
+
+
+# ============================================================================
+# module-level constants
+# ============================================================================
+
+def test_default_db_path_is_in_data_dir():
+    assert DEFAULT_DB_PATH.name == "interviews.db"
+    assert DEFAULT_DB_PATH.parent.name == "data"

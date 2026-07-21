@@ -99,6 +99,24 @@ streamlit run app.py
 - [ ] **断网状态下点开始** → 应当提示"LLM 调用失败:网络超时"
 - [ ] **输入含"结束面试"** → 自动停问,生成报告
 
+## 持久化验收(v0.3 Feature B)
+
+### 准备
+- 上述主流程跑完一场面试并出报告
+
+### 步骤
+1. **自动入库**:报告生成后应出现 `💾 已保存到历史 (id: xxxxx)` 提示
+2. **sidebar 历史区**:应出现 `📚 历史面试`,按钮显示日期 + 等级 + 轮次 + 均分
+3. **加载历史**:点历史按钮,主区出现历史对话 + 报告 + 「← 返回新面试」按钮
+4. **返回**:点返回后 sidebar 仍可看到历史,新面试状态干净
+5. **多场累积**:再跑 1 场,sidebar 出现 2 条历史(倒序)
+6. **重启持久**:关闭浏览器,重启 streamlit,刷新 → 历史仍在
+7. **PII 检查**:打开 `data/interviews.db`,grep 简历原文关键字 → 0 命中
+   ```bash
+   sqlite3 data/interviews.db "SELECT id, level, score_avg FROM interview_sessions;"
+   grep "简历原文关键字" data/interviews.db  # 应为空
+   ```
+
 ## 修复指南
 
 如果验收失败,先看 `app.py` / `prompts.py` 改动:

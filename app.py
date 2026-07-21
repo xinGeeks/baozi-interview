@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 
 import streamlit as st
 
@@ -19,6 +20,13 @@ from prompts import (
     build_report_prompt,
 )
 from resume_parser import ResumeParseError, parse_pdf_resume
+from storage import (
+    candidate_id_from_resume,
+    get_session,
+    init_db,
+    list_sessions,
+    save_session,
+)
 
 
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
@@ -71,6 +79,12 @@ st.set_page_config(
     layout="wide",
 )
 
+# 数据库初始化(幂等 + mkdir);失败不阻断 UI(主流程不依赖 DB)
+try:
+    init_db()
+except Exception as _e:
+    st.warning(f"⚠️ 历史数据库初始化失败:{_e}")
+
 st.title("🎯 AI 面试官 · 简历 + JD + 6 档分级")
 st.caption("给求职者用的面试实战模拟。基于个人简历 + 目标 JD + 职级定制,问完出复盘报告。")
 
@@ -90,6 +104,12 @@ DEFAULTS = {
     "report_text": "",
     "error_msg": "",
     "turn_feedback": [],  # 每答一题追加一次:[{"question", "score", "advice"}, ...]
+    # v0.3 Feature B: 持久化相关
+    "current_session_id": "",       # 当前 session_id(报告生成时填)
+    "loaded_session_id": "",        # 历史加载模式:加载的 session_id
+    "interview_started_at": None,   # datetime 对象,_start_interview 时记
+    "viewing_history": False,       # True 时主区显示历史 session 只读视图
+    "success_msg": "",              # 一次性提示(如"已保存到历史")
     # 测试 hook:如果 setdefault 时已存在(mock_responses 不在 DEFAULTS 但 setdefault 不会创建),
     # 保留测试设置。Streamlit 每次 rerun 都会重新执行模块顶层,所以测试需要用
     # at.session_state[...] 显式注入(在 at.run() 之前或之后第一次 set_state)。
@@ -112,6 +132,7 @@ with st.sidebar:
             if text and text != st.session_state.resume_content:
                 st.session_state.resume_content = text
                 st.success(f"✅ 简历解析完成 ({len(text)} 字)")
+                st.info("💾 面试对话将保存在本地 SQLite(不含简历原文)")
         except ResumeParseError as e:
             st.error(f"❌ 简历解析失败:{e}")
             st.session_state.resume_content = ""
@@ -151,6 +172,35 @@ with st.sidebar:
     else:
         st.warning("⚠️ 未配置 LLM_API_KEY,无法调用 LLM")
 
+    # 历史面试区(v0.3 Feature B)
+    st.divider()
+    st.caption("📚 历史面试")
+    try:
+        cid = candidate_id_from_resume(st.session_state.resume_content)
+        history = list_sessions(None, cid, limit=5)
+    except Exception:
+        history = []
+
+    if not history:
+        st.caption("（暂无历史）")
+    else:
+        for h in history:
+            score_str = (
+                f" · 均分 {h['score_avg']:.1f}"
+                if h.get("score_avg") is not None
+                else ""
+            )
+            label = (
+                f"{h['ended_at'][:10]} · {h['level']} · "
+                f"{h['turn_count']} 轮{score_str}"
+            )
+            if st.button(
+                label, key=f"hist_{h['id']}", use_container_width=True
+            ):
+                st.session_state.loaded_session_id = h["id"]
+                st.session_state.viewing_history = True
+                st.rerun()
+
 
 # ============================================================================
 # 主区:JD 粘贴
@@ -189,6 +239,10 @@ def _start_interview() -> None:
     st.session_state.interview_ended = False
     st.session_state.report_text = ""
     st.session_state.error_msg = ""
+    st.session_state.success_msg = ""
+    st.session_state.interview_started_at = datetime.now(timezone.utc)
+    st.session_state.current_session_id = ""
+    st.session_state.viewing_history = False
 
     messages = [
         {"role": "system", "content": _system_prompt()},
@@ -260,8 +314,60 @@ def _render_feedback_card(fb: dict) -> None:
     )
 
 
+def _render_history_view(session_id: str) -> None:
+    """只读渲染历史 session(对话 + 报告)。"""
+    try:
+        sess = get_session(None, session_id)
+    except Exception as e:
+        st.error(f"加载历史失败:{e}")
+        return
+
+    if sess is None:
+        st.warning(f"未找到历史会话 {session_id}")
+        return
+
+    score_str = (
+        f" · 均分 {sess['score_avg']:.1f}"
+        if sess.get("score_avg") is not None
+        else ""
+    )
+    st.caption(
+        f"📂 历史会话 · {sess['id']} · {sess['level']} · "
+        f"{sess['style']} · {sess['ended_at'][:19]}{score_str}"
+    )
+    if st.button("← 返回新面试", key="back_from_history"):
+        st.session_state.viewing_history = False
+        st.session_state.loaded_session_id = ""
+        st.rerun()
+
+    st.subheader("💬 历史对话")
+    feedback_by_idx = {f.get("turn_idx", i): f for i, f in enumerate(sess.get("feedback", []))}
+    for i, msg in enumerate(sess["turns"]):
+        if msg["role"] == "assistant":
+            with st.chat_message("assistant", avatar="👨‍🏫"):
+                st.markdown(msg["content"])
+        else:
+            with st.chat_message("user", avatar="🙋"):
+                st.markdown(msg["content"])
+            fb = feedback_by_idx.get(i // 2)
+            if fb and fb.get("score", -1) >= 0:
+                _render_feedback_card(fb)
+
+    if sess.get("report_text"):
+        st.divider()
+        st.subheader("📑 复盘报告")
+        st.markdown(sess["report_text"])
+        st.download_button(
+            "💾 下载报告 (Markdown)",
+            data=sess["report_text"],
+            file_name=f"interview_report_{sess['id']}.md",
+            mime="text/markdown",
+            key=f"dl_{sess['id']}",
+        )
+
+
 def _generate_report() -> None:
-    """结束面试,生成六维复盘报告。"""
+    """结束面试,生成六维复盘报告,并自动落盘到历史。"""
     if not st.session_state.chat_history:
         st.session_state.error_msg = "还没有面试对话,无法生成报告"
         return
@@ -279,6 +385,27 @@ def _generate_report() -> None:
         return
     st.session_state.report_text = report
     st.session_state.interview_ended = True
+
+    # 落盘(失败不阻断 UI,但记 error_msg;报告仍可读可下载)
+    try:
+        sid = save_session(
+            db_path=None,  # 让 storage 内部从 env 读最新路径(测试隔离用)
+            level=st.session_state.interview_level,
+            style=st.session_state.interview_style,
+            jd=st.session_state.jd_content,
+            resume_text=st.session_state.resume_content,
+            chat_history=list(st.session_state.chat_history),
+            turn_feedback=list(st.session_state.turn_feedback),
+            report_text=report,
+            started_at=(
+                st.session_state.interview_started_at
+                or datetime.now(timezone.utc)
+            ),
+        )
+        st.session_state.current_session_id = sid
+        st.session_state.success_msg = f"💾 已保存到历史 (id: {sid})"
+    except Exception as e:
+        st.session_state.error_msg = f"报告已生成,但保存到历史失败:{e}"
 
 
 # ============================================================================
@@ -330,6 +457,10 @@ if st.session_state.error_msg:
         st.session_state.error_msg = ""
         st.rerun()
 
+if st.session_state.success_msg:
+    st.success(st.session_state.success_msg)
+    st.session_state.success_msg = ""
+
 
 # ============================================================================
 # 聊天区
@@ -338,7 +469,9 @@ if st.session_state.error_msg:
 st.divider()
 st.subheader("💬 面试对话")
 
-if not st.session_state.chat_history:
+if st.session_state.viewing_history and st.session_state.loaded_session_id:
+    _render_history_view(st.session_state.loaded_session_id)
+elif not st.session_state.chat_history:
     st.info("👈 配置好简历 / JD / 等级后,点『开始面试』即可。")
 else:
     user_msg_seen = 0

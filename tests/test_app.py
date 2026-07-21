@@ -448,3 +448,177 @@ def test_turn_feedback_passed_to_report_prompt(configure_llm, monkeypatch):
     assert len(tf) == 2
     assert tf[0]["score"] == 8
     assert tf[1]["score"] == 6
+
+
+# ============================================================================
+# v0.3 Feature B:面试历史持久化
+# ============================================================================
+
+def test_report_auto_saved_to_db(configure_llm, monkeypatch, tmp_path):
+    """跑完一场面试,报告生成后应自动写入 SQLite。
+
+    AppTest 在子进程跑 app.py,monkeypatch 不会传过去;
+    改用 STORAGE_DB_PATH 环境变量,storage.py 启动时读它。
+    """
+    import sqlite3
+    from storage import init_db
+
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    at.session_state["mock_responses"] = [
+        "开场问题",
+        "追问 1",
+        "## 复盘报告\n1. 岗位匹配度:7/10 ...",
+    ]
+    at.session_state["mock_feedback_responses"] = [
+        "【分数】8/10\n【建议】不错。",
+    ]
+    at.text_area[0].set_value("JD 内容")
+    at.run()
+
+    start_btn = _find_button(at, lambda l: "开始面试" in l and "重新" not in l)
+    start_btn.click()
+    at.run()
+    at.chat_input[0].set_value("我的回答")
+    at.run()
+
+    end_btn = _find_button(at, lambda l: "结束面试" in l and "开始" not in l)
+    end_btn.click()
+    at.run()
+
+    # current_session_id 应已填
+    assert at.session_state["current_session_id"] != ""
+
+    # DB 应有 1 行
+    with sqlite3.connect(str(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT id, level, turn_count FROM interview_sessions"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][1] == "社招(中级)"  # DEFAULTS 默认
+    assert rows[0][2] == 1  # 1 个 user turn
+
+
+def test_history_sidebar_lists_saved_sessions(configure_llm, monkeypatch, tmp_path):
+    """保存一场后,sidebar「📚 历史面试」区应出现历史按钮。"""
+    from storage import init_db, save_session
+    from datetime import datetime, timezone
+
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
+
+    # 预先写一场
+    save_session(
+        db_path=db_path,
+        level="校招", style="温和引导",
+        jd="JD", resume_text="",
+        chat_history=[
+            {"role": "assistant", "content": "q"},
+            {"role": "user", "content": "a"},
+        ],
+        turn_feedback=[{"question": "q", "score": 7, "advice": "x"}],
+        report_text="R",
+        started_at=datetime(2026, 7, 21, tzinfo=timezone.utc),
+    )
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+
+    # sidebar 应出现历史按钮(label 含日期 + 等级 + 轮次)
+    sidebar_buttons = [b.label for b in at.sidebar.button]
+    assert any(
+        "2026-07-21" in lbl and "校招" in lbl and "1 轮" in lbl
+        for lbl in sidebar_buttons
+    ), f"历史按钮缺失,实际: {sidebar_buttons}"
+
+
+def test_load_history_renders_readonly_view(configure_llm, monkeypatch, tmp_path):
+    """点历史按钮,主区出现历史对话 + 「← 返回新面试」按钮。"""
+    from datetime import datetime, timezone
+    from storage import init_db, save_session
+
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
+
+    save_session(
+        db_path=db_path,
+        level="校招", style="温和引导",  # 用"校招"匹配 test_history_sidebar 的预期
+        jd="JD", resume_text="",
+        chat_history=[
+            {"role": "assistant", "content": "你好,请自我介绍"},
+            {"role": "user", "content": "我做 Python 后端"},
+        ],
+        turn_feedback=[],
+        report_text="## 复盘报告\n1. 沟通:7/10",
+        started_at=datetime(2026, 7, 21, tzinfo=timezone.utc),
+    )
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+
+    # 找历史按钮并点
+    hist_btns = [
+        b for b in at.sidebar.button
+        if "2026-07-21" in (b.label or "")
+    ]
+    assert len(hist_btns) >= 1
+    hist_btns[0].click()
+    at.run()
+
+    # viewing_history 应为 True
+    assert at.session_state["viewing_history"] is True
+    assert at.session_state["loaded_session_id"] != ""
+
+    # 「← 返回新面试」按钮出现
+    all_labels = [b.label for b in at.button]
+    assert any("返回新面试" in lbl for lbl in all_labels)
+
+    # 历史对话内容出现
+    md = "\n".join(m.value for m in at.markdown)
+    assert "你好,请自我介绍" in md or "复盘报告" in md
+
+
+def test_no_resume_text_persisted(configure_llm, monkeypatch, tmp_path):
+    """简历原文不应落盘(只存 hash)。"""
+    import sqlite3
+    from storage import init_db
+
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    at.session_state["resume_content"] = (
+        "张三_PII_SECRET_身份证_11010119900101_简历内容"
+    )
+    at.session_state["mock_responses"] = [
+        "q", "## 复盘报告\nx",
+    ]
+    at.text_area[0].set_value("JD")
+    at.run()
+
+    start_btn = _find_button(at, lambda l: "开始面试" in l and "重新" not in l)
+    start_btn.click()
+    at.run()
+
+    end_btn = _find_button(at, lambda l: "结束面试" in l and "开始" not in l)
+    end_btn.click()
+    at.run()
+
+    # 全文扫描 DB
+    with sqlite3.connect(str(db_path)) as conn:
+        all_text = ""
+        for table in ("interview_sessions", "interview_turns", "turn_feedback"):
+            rows = conn.execute(f"SELECT * FROM {table}").fetchall()
+            for r in rows:
+                all_text += str(r) + "\n"
+
+    assert "张三_PII_SECRET" not in all_text
+    assert "11010119900101" not in all_text
