@@ -11,7 +11,7 @@ import streamlit as st
 
 from config import get_llm_config
 from feedback import build_feedback_prompt, parse_feedback_response
-from llm import LLMError, chat
+from llm import LLMError, chat, chat_stream
 from prompts import (
     END_SIGNAL,
     LEVELS,
@@ -48,9 +48,10 @@ def _split_think_blocks(content: str) -> tuple[list[str], str]:
 # 在 import 时绑定,monkeypatch setattr 后不会跨 rerun 重置(它修改的是 app.__dict__)。
 # 实际验证:monkeypatch 后 fake.calls 仍能记录到。
 _chat_impl = chat
+_chat_stream_impl = chat_stream
 
 
-def _do_chat(messages, *, temperature=0.7, purpose="chat"):
+def _do_chat(messages, *, temperature=0.7, purpose="chat", stream=False):
     """调用 LLM。
 
     测试注入点:
@@ -59,13 +60,23 @@ def _do_chat(messages, *, temperature=0.7, purpose="chat"):
     - purpose="feedback":如果 st.session_state["mock_feedback_responses"] 存在,
       优先从该队列取响应。
     streamlit rerun 不会丢失 session_state,所以这是稳定的测试 hook。
+
+    stream=True(purpose="chat" 时有效):
+    返回 Iterator[str],供 st.write_stream 增量渲染。feedback 强制非流式
+    (需要完整响应 parse)。mock 队列下用 iter([text]) 单块模拟。
     """
     if purpose == "feedback":
         mock_q = st.session_state.get("mock_feedback_responses")
+        stream = False  # 反馈必须等完整
     else:
         mock_q = st.session_state.get("mock_responses")
     if isinstance(mock_q, list) and mock_q:
-        return mock_q.pop(0)
+        text = mock_q.pop(0)
+        if stream:
+            return iter([text])
+        return text
+    if stream and purpose == "chat":
+        return _chat_stream_impl(messages, temperature=temperature)
     return _chat_impl(messages, temperature=temperature)
 
 
@@ -229,7 +240,7 @@ def _system_prompt() -> str:
 
 
 def _start_interview() -> None:
-    """点击『开始面试』:清空历史 + 生成第一题。"""
+    """点击『开始面试』:清空历史 + 流式生成第一题。"""
     if not st.session_state.jd_content.strip():
         st.session_state.error_msg = "请先粘贴 JD 再开始面试"
         return
@@ -248,17 +259,24 @@ def _start_interview() -> None:
         {"role": "system", "content": _system_prompt()},
         {"role": "user", "content": "请开始面试"},
     ]
+    pieces: list[str] = []
     try:
-        first_q = _do_chat(messages)
+        with st.chat_message("assistant", avatar="👨‍🏫"):
+            def _first_gen():
+                for chunk in _do_chat(messages, stream=True):
+                    pieces.append(chunk)
+                    yield chunk
+            st.write_stream(_first_gen)
     except LLMError as e:
         st.session_state.error_msg = str(e)
         st.session_state.interview_started = False
         return
+    first_q = "".join(pieces)
     st.session_state.chat_history.append({"role": "assistant", "content": first_q})
 
 
 def _handle_user_answer(answer: str) -> None:
-    """用户提交回答:追加到 history → 逐轮反馈 → 生成下一题。"""
+    """用户提交回答:追加到 history → 逐轮反馈 → 流式生成下一题。"""
     st.session_state.chat_history.append({"role": "user", "content": answer})
 
     last_question = ""
@@ -267,7 +285,7 @@ def _handle_user_answer(answer: str) -> None:
             last_question = msg["content"]
             break
 
-    # 逐轮反馈(失败不中断面试:记 score=-1,渲染层不显示卡片)
+    # 逐轮反馈(反馈 LLM 不流式,继续用 _do_chat 不带 stream)
     try:
         feedback_messages = [{
             "role": "user",
@@ -296,11 +314,18 @@ def _handle_user_answer(answer: str) -> None:
     messages = [{"role": "system", "content": _system_prompt()}] + list(
         st.session_state.chat_history
     )
+    pieces: list[str] = []
     try:
-        next_q = _do_chat(messages)
+        with st.chat_message("assistant", avatar="👨‍🏫"):
+            def _next_gen():
+                for chunk in _do_chat(messages, stream=True):
+                    pieces.append(chunk)
+                    yield chunk
+            st.write_stream(_next_gen)
     except LLMError as e:
         st.session_state.error_msg = str(e)
         return
+    next_q = "".join(pieces)
     st.session_state.chat_history.append({"role": "assistant", "content": next_q})
 
 
