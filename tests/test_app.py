@@ -18,12 +18,35 @@ from tests.conftest import FakeLLM
 # ============================================================================
 
 def _make_app(responses: list[str], **kwargs) -> tuple[AppTest, FakeLLM]:
-    """构造 AppTest 并把 fake LLM 注入 session_state。"""
+    """构造 AppTest 并把 fake LLM 注入 session_state。
+
+    v0.3 alpha-kickoff: 默认绕过 ToS modal(让测试聚焦在 app 主流程上)。
+    测 ToS 自身的行为请用 tests/test_consent.py。
+    """
     at = AppTest.from_file("app.py", default_timeout=10)
+    # 在第一次 run 前注入 ToS 已接受(否则 modal 阻断所有 UI)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     # AppTest 第一次 run 后 session_state 才有;把 mock_responses 注入
     at.session_state["mock_responses"] = list(responses)
     fake = FakeLLM(list(responses))  # 记录用
+    return at, fake
+
+
+def _make_app_with_tos(responses: list[str] | None = None, **kwargs) -> tuple[AppTest, FakeLLM | None]:
+    """构造 AppTest 但不绕过 ToS(用于测试 ToS 流程)。
+
+    返回的 fake 在 tos 接受后才注入。
+    """
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
+    at.run()
+    fake = None
+    if responses is not None:
+        at.session_state["mock_responses"] = list(responses)
+        fake = FakeLLM(list(responses))
     return at, fake
 
 
@@ -37,12 +60,16 @@ def _find_button(at: AppTest, predicate):
 
 def test_app_starts_without_error():
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     assert not at.exception, f"App 启动异常: {at.exception}"
 
 
 def test_app_shows_title():
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     titles = [t.value for t in at.title]
     assert any("AI 面试官" in t for t in titles)
@@ -50,6 +77,8 @@ def test_app_shows_title():
 
 def test_sidebar_has_level_and_style_widgets():
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     assert any("面试等级" in (s.label or "") for s in at.selectbox)
     assert any("面试风格" in (r.label or "") for r in at.radio)
@@ -62,6 +91,8 @@ def test_sidebar_has_level_and_style_widgets():
 def test_start_without_jd_shows_error(configure_llm):
     """没填 JD 时点开始,应当报错且不进入对话。"""
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     start_btn = _find_button(at, lambda l: "开始面试" in l and "重新" not in l)
     assert start_btn is not None
@@ -77,6 +108,8 @@ def test_missing_api_key_warning(monkeypatch):
         api_key="", base_url="x", model="y"
     ))
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     assert any("API" in w.value or "API_KEY" in w.value for w in at.warning)
 
@@ -96,6 +129,8 @@ def test_full_flow_start_answer_end_report(configure_llm):
     5) 报告
     """
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     responses = [
         "请介绍一下你自己",
@@ -138,6 +173,8 @@ def test_full_flow_start_answer_end_report(configure_llm):
 def test_explicit_end_button_triggers_report(configure_llm):
     """用户答完后点『结束面试』按钮,显式触发报告。"""
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["mock_responses"] = [
         "请介绍一下你自己",
@@ -179,6 +216,8 @@ def test_llm_error_during_start_shows_error(configure_llm, monkeypatch):
     monkeypatch.setattr("app._do_chat", boom)
 
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.text_area[0].set_value("JD 内容")
     at.run()
@@ -200,6 +239,8 @@ def test_llm_error_during_start_shows_error(configure_llm, monkeypatch):
 def test_resume_preview_expander_shows_content(configure_llm):
     """上传简历后,sidebar 应出现 expander 含简历全文。"""
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     # 直接灌 session_state 模拟已上传简历(绕开 file_uploader)
     at.session_state["resume_content"] = (
@@ -225,6 +266,8 @@ def test_resume_preview_expander_shows_content(configure_llm):
 def test_no_resume_preview_when_empty(configure_llm):
     """未上传简历时,不应出现简历预览 expander。"""
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["resume_content"] = ""
     at.run()
@@ -282,6 +325,8 @@ class TestSplitThinkBlocks:
 def test_chat_history_with_think_shows_expander(configure_llm):
     """chat_history 含 <think> 块时,渲染应出现折叠 expander。"""
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["chat_history"] = [
         {"role": "user", "content": "自我介绍"},
@@ -305,6 +350,8 @@ def test_chat_history_with_think_shows_expander(configure_llm):
 def test_chat_history_without_think_no_expander(configure_llm):
     """chat_history 无 <think> 时,不应出现思考 expander。"""
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["chat_history"] = [
         {"role": "user", "content": "自我介绍"},
@@ -322,6 +369,8 @@ def test_chat_history_without_think_no_expander(configure_llm):
 def test_feedback_card_appears_after_user_message(configure_llm):
     """跑 2 轮对话,每轮 user message 后应出现反馈小卡。"""
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     # 主对话 3 个 mock(开场 + 2 个追问)+ 2 个反馈 mock
     at.session_state["mock_responses"] = [
@@ -377,6 +426,8 @@ def test_feedback_failure_does_not_break_interview(configure_llm, monkeypatch):
     monkeypatch.setattr("app._do_chat", selective_chat)
 
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["mock_responses"] = ["开场问题", "追问"]
     at.text_area[0].set_value("JD")
@@ -419,6 +470,8 @@ def test_turn_feedback_passed_to_report_prompt(configure_llm, monkeypatch):
     monkeypatch.setattr("prompts.build_report_prompt", fake_report_prompt)
 
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["mock_responses"] = [
         "开场", "追问", "## 复盘报告"
@@ -468,6 +521,8 @@ def test_report_auto_saved_to_db(configure_llm, monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
 
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["mock_responses"] = [
         "开场问题",
@@ -528,6 +583,8 @@ def test_history_sidebar_lists_saved_sessions(configure_llm, monkeypatch, tmp_pa
     )
 
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
 
     # sidebar 应出现历史按钮(label 含日期 + 等级 + 轮次)
@@ -562,6 +619,8 @@ def test_load_history_renders_readonly_view(configure_llm, monkeypatch, tmp_path
     )
 
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
 
     # 找历史按钮并点
@@ -596,6 +655,8 @@ def test_no_resume_text_persisted(configure_llm, monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
 
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["resume_content"] = (
         "张三_PII_SECRET_身份证_11010119900101_简历内容"
@@ -634,6 +695,8 @@ def test_no_resume_text_persisted(configure_llm, monkeypatch, tmp_path):
 def test_feedback_card_shows_warning_when_flags_present(configure_llm):
     """turn_authenticity_flags 非空时,反馈卡渲染 ⚠️ + flag 文本。"""
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["chat_history"] = [
         {"role": "assistant", "content": "介绍一下你的项目"},
@@ -653,6 +716,8 @@ def test_feedback_card_shows_warning_when_flags_present(configure_llm):
 def test_feedback_card_omits_warning_when_flags_empty(configure_llm):
     """turn_authenticity_flags 为空时,反馈卡不渲染 ⚠️。"""
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     at.session_state["chat_history"] = [
         {"role": "assistant", "content": "介绍一下你的项目"},
@@ -706,6 +771,8 @@ def test_report_end_to_end_includes_section_7(configure_llm, monkeypatch, tmp_pa
     monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
 
     at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
     at.run()
     # 4 chat + 1 report + 1 authenticity = 6 mock 响应
     responses = [

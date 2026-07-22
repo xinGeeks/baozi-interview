@@ -5,8 +5,10 @@
 ## 快速开始
 
 ```bash
-# 1. 安装依赖
+# 1. 安装依赖(alpha 用户)
 pip install -r requirements.txt
+# 开发者(测试 + 类型检查)
+pip install -r requirements.txt -r requirements-dev.txt
 
 # 2. 配置 API key
 cp .env.example .env
@@ -27,6 +29,10 @@ streamlit run app.py
 | `LLM_API_KEY` | 是 | (空) | MiniMax 平台 API key |
 | `LLM_BASE_URL` | 否 | `https://api.MiniMax.chat/v1` | OpenAI 兼容接口 |
 | `LLM_MODEL` | 否 | `MiniMax-M3` | 模型名 |
+| `LLM_DAILY_TOKEN_CAP` | 否 | `200000` | 每日 token 预算(估算,±25% 误差);0 = 不限制 |
+| `STORAGE_RETENTION_DAYS` | 否 | `30` | 历史会话保留天数;0 = 不自动清理 |
+
+更详细的成本估算见 [`docs/llm-cost.md`](docs/llm-cost.md)。
 
 ## 6 档职级
 
@@ -53,22 +59,53 @@ streamlit run app.py
 4. 逻辑思维能力
 5. 沟通表达能力
 6. 职级适配度
+7. 真实性维度(可选,v0.3 Feature E 落地)
 
 每项 0-10 分,附打分依据。报告主体是**给求职者的改进建议**(不是"录用判定")。
+
+## 数据与隐私
+
+- 简历原文**不持久化**(`storage.py` 只存 MD5 摘要作 candidate_id)
+- 面试对话存在本地 SQLite(`data/interviews.db`),可单条删除 / 一键清空
+- 30 天自动清理过期 session(`STORAGE_RETENTION_DAYS` 可调)
+- 详见 [`docs/privacy.md`](docs/privacy.md)
 
 ## 开发
 
 ```bash
 # 跑测试
 pytest
+# 含覆盖率
+pytest --cov=. --cov-report=term-missing
 
 # 手动 smoke(需 API key)
 # 见 tests/manual/smoke.md
+
+# 类型检查
+mypy *.py
 ```
+
+## Troubleshooting
+
+| 症状 | 原因 | 解决 |
+|---|---|---|
+| sidebar 红色提示"未配置 LLM_API_KEY" | `.env` 缺 key 或没复制 | `cp .env.example .env` 后填入 `LLM_API_KEY` |
+| 启动后立刻报 `AuthError` / `API key 无效` | key 错 / 平台余额不足 | 检查 `.env`;登录 MiniMax 控制台查余额 |
+| 报 `RateLimitError` / 请求过快 | 单日请求超过平台配额 | 暂停几分钟;或切到更便宜模型 |
+| 报 `TransientError` / 网络不稳定 | VPN / 防火墙 / 平台抖动 | 重试;若持续失败检查网络 |
+| sidebar 红色"今日预算已用完" | 估算 token 达到 `LLM_DAILY_TOKEN_CAP` | 调高 `.env` 中 `LLM_DAILY_TOKEN_CAP`;或等到 UTC 0 点重置 |
+| 历史区空白 | DB 文件被删 / 换了机器 | 检查 `data/interviews.db` 路径;`STORAGE_DB_PATH` 显式设置 |
+| 上传 PDF 后报错"简历解析失败" | PDF 是扫描件 / 加密 | 转 Word / 纯文本粘贴 |
 
 ## 范围边界(MVP)
 
-**做**:PDF 简历 + JD + 6 档 + 2 风格 + 一问一答 + 六维报告
-**不做**:Word 简历 / 语音 / 英文 / 历史存档 / 报告导出 / 打分校准 / 真实度检测
+**做**:PDF 简历 + JD + 6 档 + 2 风格 + 一问一答 + 六维报告 + 逐轮反馈 + 历史持久化 + 流式输出 + 真实度检测
+**不做**:Word 简历 / 语音 / 英文 / 跨设备同步 / 云部署 / 真实成本核算(估算,±25% 误差)
 
-详见 `openspec/changes/archive/2026-07-21-mvp-ai-interviewer/`。
+详见 `openspec/changes/archive/`。
+
+## 相关文档
+
+- [`docs/alpha.md`](docs/alpha.md) — Alpha 邀请计划 + 时间窗 + 成功标准
+- [`docs/privacy.md`](docs/privacy.md) — PII 处理原则 + ToS 全文
+- [`docs/llm-cost.md`](docs/llm-cost.md) — 单场面试成本估算 + 模型选型

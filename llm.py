@@ -1,25 +1,69 @@
 """LLM 调用的薄封装。
 
 把 OpenAI SDK 调用集中在一处,主应用不直接依赖 SDK,方便测试时 monkeypatch。
+
+v0.3 alpha-kickoff: LLMError 拆 4 子类,主应用按子类给不同提示。
 """
 from __future__ import annotations
 
 from typing import Iterable, Iterator
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from config import LLMConfig, get_llm_config
 
 
 class LLMError(Exception):
-    """LLM 调用失败(网络/限流/鉴权/解析),主应用据此展示友好提示。"""
+    """LLM 调用失败(基类)。"""
+
+
+class AuthError(LLMError):
+    """鉴权失败(API key 错 / 无权限 / 平台余额不足)。"""
+
+
+class RateLimitError_(LLMError):
+    """请求过快 / 触发限流。"""
+
+
+class TransientError(LLMError):
+    """临时性错误(网络抖动 / 服务端 5xx / 超时)。通常可重试。"""
+
+
+class UnknownError(LLMError):
+    """未归类异常(兜底)。"""
+
+
+# 注:RateLimitError_ 下划线避免与 openai.RateLimitError 冲突
+
+
+def _classify_sdk_exception(e: Exception) -> LLMError:
+    """把 openai SDK 异常归到 4 个 LLMError 子类。"""
+    msg = f"{type(e).__name__}: {e}"
+    if isinstance(e, (AuthenticationError, PermissionDeniedError)):
+        return AuthError(f"API key 无效或权限不足:{msg}")
+    if isinstance(e, RateLimitError):
+        return RateLimitError_(f"请求过快或触发限流:{msg}")
+    if isinstance(e, (APIConnectionError, APITimeoutError)):
+        return TransientError(f"网络不稳定或服务超时:{msg}")
+    # openai 还可能抛 BadRequestError / InternalServerError 等
+    name = type(e).__name__
+    if "InternalServer" in name or "Server" in name:
+        return TransientError(f"服务端错误:{msg}")
+    return UnknownError(f"LLM 调用失败:{msg}")
 
 
 def make_client(cfg: LLMConfig | None = None) -> OpenAI:
     """构造 OpenAI 兼容 client,默认从环境/.env 读配置。"""
     cfg = cfg or get_llm_config()
     if not cfg.is_configured():
-        raise LLMError("未配置 LLM_API_KEY,请在 .env 或环境变量中设置")
+        raise AuthError("未配置 LLM_API_KEY,请在 .env 或环境变量中设置")
     return OpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
 
 
@@ -30,14 +74,7 @@ def chat(
     model: str | None = None,
     temperature: float = 0.7,
 ) -> str:  # noqa: D401
-    """调一次 chat.completions,返回首个 choice 的 content 文本。
-
-    Args:
-        messages: OpenAI 格式消息列表
-        cfg: LLM 配置;None 时自动从 env 读
-        model: 覆盖 cfg.model
-        temperature: 采样温度
-    """
+    """调一次 chat.completions,返回首个 choice 的 content 文本。"""
     cfg = cfg or get_llm_config()
     client = make_client(cfg)
     try:
@@ -46,13 +83,15 @@ def chat(
             messages=list(messages),
             temperature=temperature,
         )
-    except Exception as e:  # 任何 SDK 异常统一封装,主应用只关心 LLMError
-        raise LLMError(f"LLM 调用失败:{type(e).__name__}: {e}") from e
+    except LLMError:
+        raise
+    except Exception as e:
+        raise _classify_sdk_exception(e) from e
 
     try:
         return res.choices[0].message.content or ""
     except (AttributeError, IndexError) as e:
-        raise LLMError(f"LLM 响应格式异常:{e}") from e
+        raise UnknownError(f"LLM 响应格式异常:{e}") from e
 
 
 def chat_stream(
@@ -62,21 +101,7 @@ def chat_stream(
     model: str | None = None,
     temperature: float = 0.7,
 ) -> Iterator[str]:
-    """流式调一次 chat.completions(stream=True),逐块 yield 增量文本。
-
-    与 chat() 区别:首字延迟低(<500ms 常见),适合 UX 关键的追问流。
-    异常同样统一封装为 LLMError;但**已经在流里 yield 过的块不能回滚**,
-    由调用方决定是否拼接已收到的部分。
-
-    Args:
-        messages: OpenAI 格式消息列表
-        cfg: LLM 配置;None 时自动从 env 读
-        model: 覆盖 cfg.model
-        temperature: 采样温度
-
-    Yields:
-        增量文本片段(逐块拼接 = 完整响应)
-    """
+    """流式调一次 chat.completions(stream=True),逐块 yield 增量文本。"""
     cfg = cfg or get_llm_config()
     client = make_client(cfg)
     try:
@@ -86,15 +111,15 @@ def chat_stream(
             temperature=temperature,
             stream=True,
         )
+    except LLMError:
+        raise
     except Exception as e:
-        raise LLMError(f"LLM 调用失败:{type(e).__name__}: {e}") from e
+        raise _classify_sdk_exception(e) from e
 
     try:
         for chunk in stream:
-            # delta.content 可能是 None(心跳/终止块);空字符串也跳过
             piece = chunk.choices[0].delta.content
             if piece:
                 yield piece
     except Exception as e:
-        # 流中途出错:已 yield 的部分留给调用方,只把异常抛出
-        raise LLMError(f"LLM 流中断:{type(e).__name__}: {e}") from e
+        raise TransientError(f"LLM 流中断:{type(e).__name__}: {e}") from e

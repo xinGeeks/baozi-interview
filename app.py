@@ -5,13 +5,25 @@
 from __future__ import annotations
 
 import re
+import sys
+import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 
 import streamlit as st
 
-from config import get_llm_config
+from config import get_daily_token_cap, get_llm_config, get_retention_days
+from cost import DailyTokenCounter, estimate_messages_tokens, estimate_tokens
 from feedback import build_feedback_prompt, parse_feedback_response
-from llm import LLMError, chat, chat_stream
+from llm import (
+    AuthError,
+    LLMError,
+    RateLimitError_,
+    TransientError,
+    UnknownError,
+    chat,
+    chat_stream,
+)
 from prompts import (
     END_SIGNAL,
     LEVELS,
@@ -22,9 +34,14 @@ from prompts import (
 from resume_parser import ResumeParseError, parse_pdf_resume
 from storage import (
     candidate_id_from_resume,
+    clear_all_sessions_for_candidate,
+    delete_session,
     get_session,
+    has_accepted_tos,
     init_db,
     list_sessions,
+    purge_expired_sessions,
+    record_consent,
     save_session,
 )
 from authenticity import (
@@ -36,6 +53,28 @@ from authenticity import (
 
 
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+# v0.3 alpha-kickoff: ToS 版本号。修改 ToS 内容时需 bump,会触发重新接受。
+TOS_VERSION = "2026-07-22-v1"
+
+# 复用文本(UI 通知 + file_uploader help + ToS modal 摘要)
+PII_NOTICE = (
+    "📌 简历原文**不持久化**,仅用于本场面试上下文;对话记录保存在本地 SQLite,"
+    "可在历史区删除。详见侧边栏底部与 [docs/privacy.md](docs/privacy.md)。"
+)
+PII_NOTICE_PLAIN = (
+    "简历原文不持久化,仅用于本场面试上下文;对话记录保存在本地 SQLite,"
+    "可在历史区删除。"
+)
+TOS_SUMMARY = (
+    "本工具:\n"
+    "- 不存简历原文,只存对话 + 报告\n"
+    "- 不向任何第三方分享数据(LLM 调用除外)\n"
+    "- 30 天后自动清理历史(可配 STORAGE_RETENTION_DAYS)\n"
+    "- 你随时可在历史区单条删除 / 一键清空\n\n"
+    "本工具**不构成录用判断**,仅作求职者自查参考。"
+)
 
 
 def _split_think_blocks(content: str) -> tuple[list[str], str]:
@@ -70,7 +109,14 @@ def _do_chat(messages, *, temperature=0.7, purpose="chat", stream=False):
     stream=True(purpose="chat" 时有效):
     返回 Iterator[str],供 st.write_stream 增量渲染。feedback 强制非流式
     (需要完整响应 parse)。mock 队列下用 iter([text]) 单块模拟。
+
+    v0.3 alpha-kickoff: 每次调用前先估算 input tokens 累加;流式下收尾时
+    再累加 output 估算。预算超限时仍允许调用(仅 UI 警告 / 禁用输入框),
+    不阻断 LLM 调用本身(避免半路崩掉用户体验)。
     """
+    # 估算并累加 input tokens(进入前)
+    _token_counter().add(estimate_messages_tokens(messages))
+
     if purpose == "feedback":
         mock_q = st.session_state.get("mock_feedback_responses")
         stream = False  # 反馈必须等完整
@@ -79,11 +125,101 @@ def _do_chat(messages, *, temperature=0.7, purpose="chat", stream=False):
     if isinstance(mock_q, list) and mock_q:
         text = mock_q.pop(0)
         if stream:
-            return iter([text])
+            return _TrackingStream(iter([text]))
+        _token_counter().add(estimate_tokens(text))  # 累加 mock output
         return text
     if stream and purpose == "chat":
-        return _chat_stream_impl(messages, temperature=temperature)
-    return _chat_impl(messages, temperature=temperature)
+        return _TrackingStream(_chat_stream_impl(messages, temperature=temperature))
+    result = _chat_impl(messages, temperature=temperature)
+    _token_counter().add(estimate_tokens(result))
+    return result
+
+
+class _TrackingStream:
+    """包装 stream iterator,累加 output token 数(在迭代结束时)。
+
+    不修改 yield 行为,只顺手累加成本。
+    """
+    def __init__(self, inner):
+        self._inner = inner
+        self._buffer: list[str] = []
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        chunk = next(self._inner)
+        self._buffer.append(chunk)
+        return chunk
+
+    def close(self):
+        # 迭代结束 / GC 时累加 output
+        if self._buffer:
+            _token_counter().add(estimate_tokens("".join(self._buffer)))
+            self._buffer = []
+
+
+def _token_counter() -> DailyTokenCounter:
+    """懒初始化 token 计数器(确保 cap 与 env 同步)。"""
+    if st.session_state.token_counter is None:
+        st.session_state.token_counter = DailyTokenCounter(cap=get_daily_token_cap())
+    else:
+        # cap 可能因 .env 改动而变;每次访问同步
+        st.session_state.token_counter.cap = get_daily_token_cap()
+    return st.session_state.token_counter
+
+
+# ============================================================================
+# 全局异常处理(v0.3 alpha-kickoff)
+# 注册 sys.excepthook → 未捕获异常写 data/error.log + 不让页面整块挂掉
+# ============================================================================
+
+_ERROR_LOG_PATH = Path(__file__).parent / "data" / "error.log"
+
+
+def _install_global_error_handler() -> None:
+    """注册 sys.excepthook,记录未捕获异常。只记 type + 截断 200 字,不记 resume。"""
+    def _hook(exc_type, exc_value, exc_tb):
+        # 过滤 KeyboardInterrupt / SystemExit(用户主动终止,非 bug)
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        try:
+            _ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tb_text = "".join(
+                traceback.format_exception(exc_type, exc_value, exc_tb)
+            )[:500]
+            with _ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
+                f.write(
+                    f"[{datetime.now(timezone.utc).isoformat()}] "
+                    f"{exc_type.__name__}: {str(exc_value)[:200]}\n{tb_text}\n"
+                    f"{'-' * 60}\n"
+                )
+        except Exception:
+            pass  # 兜底:error.log 写失败也不抛
+        # 不调 sys.__excepthook__,避免打印到 stderr 把终端刷爆
+    sys.excepthook = _hook
+
+
+_install_global_error_handler()
+
+
+# ============================================================================
+# 错误友好提示(v0.3 alpha-kickoff)
+# ============================================================================
+
+
+def _user_friendly_error(e: LLMError) -> str:
+    """把 LLMError 子类翻译成用户可读的中文提示。"""
+    if isinstance(e, AuthError):
+        return "🔑 API key 无效或权限不足。请检查 .env 中的 LLM_API_KEY,或登录平台控制台确认账户状态。"
+    if isinstance(e, RateLimitError_):
+        return "⏱️ 请求过快或触发限流。请稍候 30 秒后重试;或考虑切到更便宜的模型。"
+    if isinstance(e, TransientError):
+        return "🌐 网络不稳定或服务暂时不可达。请检查网络后重试;若持续失败请反馈。"
+    if isinstance(e, UnknownError):
+        return f"❓ 未知错误:{str(e)[:200]}。详情见 data/error.log。"
+    return f"❌ LLM 调用失败:{str(e)[:200]}"
 
 
 # ============================================================================
@@ -99,6 +235,10 @@ st.set_page_config(
 # 数据库初始化(幂等 + mkdir);失败不阻断 UI(主流程不依赖 DB)
 try:
     init_db()
+    # v0.3 alpha-kickoff: lazy 清理过期 session(retention_days=0 时不删)
+    _retention = get_retention_days()
+    if _retention > 0:
+        purge_expired_sessions(None, _retention)
 except Exception as _e:
     st.warning(f"⚠️ 历史数据库初始化失败:{_e}")
 
@@ -130,6 +270,10 @@ DEFAULTS = {
     # v0.3 Feature E: 真实性检测
     "turn_authenticity_flags": [],  # 每答一题追加一次:list[str],per-turn 启发式信号
     "authenticity_report": None,    # AuthenticityReport 或 None(报告末尾 LLM 聚合结果)
+    # v0.3 alpha-kickoff: ToS / 成本 / 删除
+    "tos_accepted": False,          # 当前 candidate_id + TOS_VERSION 是否接受
+    "tos_check_done": False,        # 是否已查过 DB(避免每次 rerun 都查)
+    "token_counter": None,          # DailyTokenCounter(懒初始化,见 _token_counter)
     # 测试 hook:如果 setdefault 时已存在(mock_responses 不在 DEFAULTS 但 setdefault 不会创建),
     # 保留测试设置。Streamlit 每次 rerun 都会重新执行模块顶层,所以测试需要用
     # at.session_state[...] 显式注入(在 at.run() 之前或之后第一次 set_state)。
@@ -144,8 +288,13 @@ for k, v in DEFAULTS.items():
 
 with st.sidebar:
     st.header("📋 面试配置")
+    st.caption(PII_NOTICE_PLAIN)
 
-    uploaded = st.file_uploader("上传简历 (PDF)", type=["pdf"])
+    uploaded = st.file_uploader(
+        "上传简历 (PDF)",
+        type=["pdf"],
+        help=PII_NOTICE_PLAIN,
+    )
     if uploaded is not None:
         try:
             text = parse_pdf_resume(uploaded.read())
@@ -192,6 +341,25 @@ with st.sidebar:
     else:
         st.warning("⚠️ 未配置 LLM_API_KEY,无法调用 LLM")
 
+    # 预算条(v0.3 alpha-kickoff)
+    _tc = _token_counter()
+    if _tc.cap > 0:
+        if _tc.is_blocked:
+            st.error(
+                f"❌ 今日预算已用完 ({_tc.current:,} / {_tc.cap:,} tokens)。"
+                "明日 UTC 0 点重置,或调高 .env 中 LLM_DAILY_TOKEN_CAP。"
+            )
+        elif _tc.is_warning:
+            st.warning(
+                f"⚠️ 已用 {_tc.percent:.0%} 今日预算 "
+                f"({_tc.current:,} / {_tc.cap:,} tokens,估算 ±25%)"
+            )
+        else:
+            st.progress(
+                min(_tc.percent, 1.0),
+                text=f"今日预算:{_tc.current:,} / {_tc.cap:,} tokens",
+            )
+
     # 历史面试区(v0.3 Feature B)
     st.divider()
     st.caption("📚 历史面试")
@@ -214,12 +382,109 @@ with st.sidebar:
                 f"{h['ended_at'][:10]} · {h['level']} · "
                 f"{h['turn_count']} 轮{score_str}"
             )
+            col_a, col_b = st.columns([4, 1])
+            with col_a:
+                if st.button(
+                    label, key=f"hist_{h['id']}", use_container_width=True
+                ):
+                    st.session_state.loaded_session_id = h["id"]
+                    st.session_state.viewing_history = True
+                    st.rerun()
+            with col_b:
+                # 单条删除(二次确认通过 popover)
+                with st.popover("🗑️"):
+                    st.caption(
+                        f"将永久删除 {h['ended_at'][:10]} 的 {h['turn_count']} 轮面试。"
+                    )
+                    if st.button(
+                        "确认删除",
+                        key=f"del_{h['id']}",
+                        type="secondary",
+                        use_container_width=True,
+                    ):
+                        try:
+                            delete_session(None, h["id"])
+                            st.session_state.success_msg = (
+                                f"🗑️ 已删除 {h['ended_at'][:10]} 的面试"
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"删除失败:{e}")
+
+        # 批量清空按钮(强制输入"确认删除")
+        with st.expander("⚠️ 清空我的全部历史", expanded=False):
+            st.caption(
+                f"将永久删除你的全部 {len(history)} 条历史 session。"
+            )
+            confirm_text = st.text_input(
+                '输入"确认删除"以启用按钮',
+                key="bulk_clear_confirm",
+            )
             if st.button(
-                label, key=f"hist_{h['id']}", use_container_width=True
+                "清空全部历史",
+                key="bulk_clear_btn",
+                type="secondary",
+                disabled=(confirm_text.strip() != "确认删除"),
+                use_container_width=True,
             ):
-                st.session_state.loaded_session_id = h["id"]
-                st.session_state.viewing_history = True
+                try:
+                    _cid = candidate_id_from_resume(
+                        st.session_state.resume_content
+                    )
+                    n = clear_all_sessions_for_candidate(None, _cid)
+                    st.session_state.success_msg = (
+                        f"🗑️ 已清空 {n} 条历史 session"
+                    )
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"清空失败:{e}")
+
+
+# ============================================================================
+# ToS 接受闸门(v0.3 alpha-kickoff)
+# 未接受当前 TOS_VERSION → 强制 modal + 禁用开始面试
+# ============================================================================
+
+if not st.session_state.tos_check_done:
+    try:
+        _cid = candidate_id_from_resume(st.session_state.resume_content)
+        st.session_state.tos_accepted = has_accepted_tos(None, _cid, TOS_VERSION)
+    except Exception:
+        st.session_state.tos_accepted = False
+    st.session_state.tos_check_done = True
+
+if not st.session_state.tos_accepted:
+    st.subheader("📜 服务条款 (ToS)")
+    with st.container(border=True):
+        st.markdown(f"**版本**:`{TOS_VERSION}`")
+        st.markdown(TOS_SUMMARY)
+        with st.expander("完整隐私政策与 ToS", expanded=False):
+            try:
+                tos_text = (Path(__file__).parent / "docs" / "privacy.md").read_text(
+                    encoding="utf-8"
+                )
+                st.markdown(tos_text)
+            except Exception as e:
+                st.warning(f"无法加载完整 ToS 文本:{e}")
+        agreed = st.checkbox(
+            f"我已阅读并同意 {TOS_VERSION} 版本的服务条款与隐私政策",
+            key="tos_checkbox",
+        )
+        if st.button(
+            "✅ 确认接受",
+            type="primary",
+            disabled=not agreed,
+            use_container_width=True,
+        ):
+            try:
+                _cid = candidate_id_from_resume(st.session_state.resume_content)
+                record_consent(None, _cid, TOS_VERSION)
+                st.session_state.tos_accepted = True
+                st.success("✅ 已接受 ToS,现在可以开始面试")
                 st.rerun()
+            except Exception as e:
+                st.error(f"记录接受状态失败:{e}")
+    st.stop()
 
 
 # ============================================================================
@@ -277,7 +542,11 @@ def _start_interview() -> None:
                     yield chunk
             st.write_stream(_first_gen)
     except LLMError as e:
-        st.session_state.error_msg = str(e)
+        st.session_state.error_msg = _user_friendly_error(e)
+        st.session_state.interview_started = False
+        return
+    except Exception as e:
+        st.session_state.error_msg = f"❌ 意外错误:{type(e).__name__}: {str(e)[:200]}"
         st.session_state.interview_started = False
         return
     first_q = "".join(pieces)
@@ -340,7 +609,10 @@ def _handle_user_answer(answer: str) -> None:
                     yield chunk
             st.write_stream(_next_gen)
     except LLMError as e:
-        st.session_state.error_msg = str(e)
+        st.session_state.error_msg = _user_friendly_error(e)
+        return
+    except Exception as e:
+        st.session_state.error_msg = f"❌ 意外错误:{type(e).__name__}: {str(e)[:200]}"
         return
     next_q = "".join(pieces)
     st.session_state.chat_history.append({"role": "assistant", "content": next_q})
@@ -436,7 +708,10 @@ def _generate_report() -> None:
     try:
         report = _do_chat([{"role": "user", "content": prompt}], temperature=0.4)
     except LLMError as e:
-        st.session_state.error_msg = str(e)
+        st.session_state.error_msg = _user_friendly_error(e)
+        return
+    except Exception as e:
+        st.session_state.error_msg = f"❌ 报告生成意外错误:{type(e).__name__}: {str(e)[:200]}"
         return
     st.session_state.report_text = report
     st.session_state.interview_ended = True
@@ -614,8 +889,17 @@ else:
 # ============================================================================
 
 if st.session_state.interview_started and not st.session_state.interview_ended:
-    user_input = st.chat_input("输入你的回答 (含『结束面试』可提前结束)")
-    if user_input:
+    _budget_blocked = _token_counter().is_blocked
+    if _budget_blocked:
+        st.warning(
+            "⛔ 今日 token 预算已用完,无法继续面试。"
+            "可结束面试并生成报告,或等到 UTC 0 点重置。"
+        )
+    user_input = st.chat_input(
+        "输入你的回答 (含『结束面试』可提前结束)",
+        disabled=_budget_blocked,
+    )
+    if user_input and not _budget_blocked:
         _handle_user_answer(user_input)
         if END_SIGNAL in user_input:
             _generate_report()

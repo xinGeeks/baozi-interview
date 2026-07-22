@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS turn_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_feedback_session
     ON turn_feedback(session_id, turn_idx);
+
+CREATE TABLE IF NOT EXISTS consent_log (
+    candidate_id    TEXT NOT NULL,
+    tos_version     TEXT NOT NULL,
+    accepted_at     TEXT NOT NULL,
+    UNIQUE(candidate_id, tos_version)
+);
 """
 
 
@@ -222,3 +229,102 @@ def get_session(db_path: Path | None, session_id: str) -> dict | None:
             ).fetchall()
         ]
         return result
+
+
+# ============================================================================
+# ToS 接受记录(v0.3 alpha-kickoff)
+# ============================================================================
+
+
+def record_consent(
+    db_path: Path | None,
+    candidate_id: str,
+    tos_version: str,
+    accepted_at: datetime | None = None,
+) -> None:
+    """记录 ToS 接受。重复接受同一 version → UNIQUE 约束静默忽略。"""
+    if db_path is None:
+        db_path = _default_db_path()
+    accepted_at = accepted_at or datetime.now(timezone.utc)
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO consent_log
+              (candidate_id, tos_version, accepted_at)
+            VALUES (?, ?, ?)
+            """,
+            (candidate_id, tos_version, accepted_at.isoformat()),
+        )
+
+
+def has_accepted_tos(
+    db_path: Path | None, candidate_id: str, tos_version: str
+) -> bool:
+    """该 candidate 是否已接受过指定 tos_version。"""
+    if db_path is None:
+        db_path = _default_db_path()
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM consent_log
+            WHERE candidate_id = ? AND tos_version = ?
+            """,
+            (candidate_id, tos_version),
+        ).fetchone()
+    return row is not None
+
+
+# ============================================================================
+# 删除 / 保留清理(v0.3 alpha-kickoff)
+# ============================================================================
+
+
+def delete_session(db_path: Path | None, session_id: str) -> bool:
+    """删除单条 session。turns/feedback 通过 ON DELETE CASCADE 级联清。
+
+    Returns:
+        True: 删了;False: 不存在。
+    """
+    if db_path is None:
+        db_path = _default_db_path()
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            "DELETE FROM interview_sessions WHERE id = ?", (session_id,)
+        )
+    return cur.rowcount > 0
+
+
+def clear_all_sessions_for_candidate(
+    db_path: Path | None, candidate_id: str
+) -> int:
+    """清空该 candidate 全部 session。Returns 删除条数。"""
+    if db_path is None:
+        db_path = _default_db_path()
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            "DELETE FROM interview_sessions WHERE candidate_id = ?",
+            (candidate_id,),
+        )
+    return cur.rowcount
+
+
+def purge_expired_sessions(
+    db_path: Path | None, retention_days: int
+) -> int:
+    """删除 ended_at 早于 (now - retention_days) 的 session。
+
+    retention_days <= 0 → 不删(返回 0)。
+    Returns 删除条数。
+    """
+    if retention_days <= 0:
+        return 0
+    if db_path is None:
+        db_path = _default_db_path()
+    cutoff = datetime.now(timezone.utc).timestamp() - retention_days * 86400
+    cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            "DELETE FROM interview_sessions WHERE ended_at < ?",
+            (cutoff_iso,),
+        )
+    return cur.rowcount
