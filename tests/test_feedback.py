@@ -84,8 +84,8 @@ class TestBuildFeedbackPrompt:
 
     def test_contains_hard_constraints(self):
         prompt = build_feedback_prompt("校招", "自我介绍", "我叫张三")
-        # 硬约束关键词
-        assert "拉开差距" in prompt
+        # 硬约束关键词(v0.3 反虚高:把'拉开差距'换成'默认落 4-6'具体化)
+        assert "大多数普通回答应落 4-6" in prompt or "大多数" in prompt
         assert "禁止" in prompt
         assert "套话" in prompt
 
@@ -101,3 +101,35 @@ class TestBuildFeedbackPrompt:
         assert "严格两行" in prompt
         assert "【分数】N/10" in prompt
         assert "【建议】" in prompt
+
+    def test_anti_inflation_anchor_section_present(self):
+        """反虚高锚定段必须存在(每档分数绑具体证据)。"""
+        prompt = build_feedback_prompt("社招(中级)", "q", "a")
+        assert "反虚高锚定" in prompt
+
+    def test_default_anchor_is_5_not_7(self):
+        """默认锚是 5(及格线),不是 6-7。这是 v0.3 打分校准的核心改动。"""
+        prompt = build_feedback_prompt("校招", "q", "a")
+        assert "5 分 = 默认" in prompt
+        # 必须显式说"大多数普通回答应落 4-6"
+        assert "4-6" in prompt or "大多数" in prompt
+
+    def test_8_plus_requires_quantified_evidence(self):
+        """8 分以上必须要求可量化成果 / 独特洞察,而不仅是『答得不错』。"""
+        prompt = build_feedback_prompt("社招(高级)", "q", "a")
+        assert "8 分" in prompt
+        assert "量化" in prompt
+        assert "9 分" in prompt  # 9 分的稀有性必须显式标注
+        assert "极罕见" in prompt or "罕见" in prompt
+
+    def test_7_plus_requires_evidence_or_drop_to_5(self):
+        """想给 7+ 必须有证据,否则扣到 5。这条规则是反虚高的强制门。"""
+        prompt = build_feedback_prompt("实习", "q", "a")
+        assert "7+" in prompt or "7 分" in prompt
+        assert "扣到 5" in prompt
+
+    def test_low_score_requires_concrete_deduction_reason(self):
+        """≤4 分必须能列出具体扣分点(防止 LLM 给低分时不解释)。"""
+        prompt = build_feedback_prompt("校招", "q", "a")
+        assert "≤4" in prompt or "4 分" in prompt
+        assert "扣分点" in prompt
