@@ -512,7 +512,7 @@ def test_history_sidebar_lists_saved_sessions(configure_llm, monkeypatch, tmp_pa
     init_db(db_path)
     monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
 
-    # 预先写一场
+    # 预先写一场(显式传 ended_at,这样 sidebar label 的日期才是 2026-07-21)
     save_session(
         db_path=db_path,
         level="校招", style="温和引导",
@@ -524,6 +524,7 @@ def test_history_sidebar_lists_saved_sessions(configure_llm, monkeypatch, tmp_pa
         turn_feedback=[{"question": "q", "score": 7, "advice": "x"}],
         report_text="R",
         started_at=datetime(2026, 7, 21, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 7, 21, 12, 0, 0, tzinfo=timezone.utc),
     )
 
     at = AppTest.from_file("app.py", default_timeout=10)
@@ -557,6 +558,7 @@ def test_load_history_renders_readonly_view(configure_llm, monkeypatch, tmp_path
         turn_feedback=[],
         report_text="## 复盘报告\n1. 沟通:7/10",
         started_at=datetime(2026, 7, 21, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 7, 21, 12, 0, 0, tzinfo=timezone.utc),
     )
 
     at = AppTest.from_file("app.py", default_timeout=10)
