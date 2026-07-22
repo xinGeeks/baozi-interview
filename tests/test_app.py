@@ -624,3 +624,121 @@ def test_no_resume_text_persisted(configure_llm, monkeypatch, tmp_path):
 
     assert "张三_PII_SECRET" not in all_text
     assert "11010119900101" not in all_text
+
+
+# ============================================================================
+# v0.3 Feature E: 真实性检测(per-turn ⚠️ + 报告第 7 段)
+# ============================================================================
+
+
+def test_feedback_card_shows_warning_when_flags_present(configure_llm):
+    """turn_authenticity_flags 非空时,反馈卡渲染 ⚠️ + flag 文本。"""
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    at.session_state["chat_history"] = [
+        {"role": "assistant", "content": "介绍一下你的项目"},
+        {"role": "user", "content": "我做过。"},
+    ]
+    at.session_state["turn_feedback"] = [
+        {"question": "介绍一下你的项目", "score": 5, "advice": "补具体细节"},
+    ]
+    at.session_state["turn_authenticity_flags"] = [["过于简短"]]
+    at.run()
+
+    md = "\n".join(m.value for m in at.markdown)
+    assert "⚠️" in md, f"期望 ⚠️ 在 markdown 中,实际: {md[:300]}"
+    assert "过于简短" in md
+
+
+def test_feedback_card_omits_warning_when_flags_empty(configure_llm):
+    """turn_authenticity_flags 为空时,反馈卡不渲染 ⚠️。"""
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    at.session_state["chat_history"] = [
+        {"role": "assistant", "content": "介绍一下你的项目"},
+        {"role": "user", "content": "我做了一个电商订单系统,QPS 5000。"},
+    ]
+    at.session_state["turn_feedback"] = [
+        {"question": "介绍一下你的项目", "score": 7, "advice": "数据具体"},
+    ]
+    at.session_state["turn_authenticity_flags"] = [[]]
+    at.run()
+
+    md = "\n".join(m.value for m in at.markdown)
+    assert "⚠️" not in md, f"不应出现 ⚠️,实际: {md[:300]}"
+    # 反馈卡的分数 / 建议仍渲染
+    assert "7/10" in md
+    assert "数据具体" in md
+
+
+def test_report_renders_section_7_when_authenticity_valid(configure_llm, monkeypatch, tmp_path):
+    """authenticity_report score=0.7 时,报告末尾追加第 7 段。"""
+    from authenticity import AuthenticityReport, Finding
+    from app import _render_authenticity_section
+
+    # 直接调纯函数渲染,不依赖真实 LLM
+    report = AuthenticityReport(
+        score=0.7,
+        findings=[Finding(turn=2, issue="答非所问", detail="问项目却聊生活")],
+        summary="整体一致性一般",
+    )
+    md = _render_authenticity_section(report)
+    assert "真实性" in md
+    assert "70" in md  # 0.7 * 100 = 70
+    assert "答非所问" in md
+    assert "整体一致性一般" in md
+
+
+def test_report_hides_section_7_when_parse_failed(configure_llm):
+    """authenticity_report score=-1( sentinel)时,不渲染第 7 段。"""
+    from authenticity import AuthenticityReport
+    from app import _render_authenticity_section
+
+    report = AuthenticityReport(score=-1.0, summary="LLM 解析失败")
+    md = _render_authenticity_section(report)
+    assert md == "", f"sentinel 应返回空串,实际: {md[:200]}"
+
+
+def test_report_end_to_end_includes_section_7(configure_llm, monkeypatch, tmp_path):
+    """完整流程跑下来,score=0.7 时报告含第 7 段。"""
+    db_path = tmp_path / "test.db"
+    db_path.parent.mkdir(exist_ok=True)
+    monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.run()
+    # 4 chat + 1 report + 1 authenticity = 6 mock 响应
+    responses = [
+        "请介绍一下你自己",                                # 1. 第一题
+        "好的,讲讲项目",                                  # 2. 追问 1
+        "这个项目你具体负责什么?",                         # 3. 追问 2
+        "好的,本场模拟面试到此结束。",                    # 4. 结束语
+        "## 复盘报告\n\n### 六维度打分\n1. 沟通:7/10",   # 5. 报告
+        '{"score": 0.7, "findings": [{"turn": 1, "issue": "模板化", "detail": "泛词无数据"}], "summary": "整体可改进"}',  # 6. 真实性聚合
+    ]
+    at.session_state["mock_responses"] = list(responses)
+    at.session_state["resume_content"] = "张三 5年 Python 后端 订单系统 MySQL 高并发"
+
+    at.text_area[0].set_value("Python 后端 JD")
+    start_btn = _find_button(at, lambda l: "开始面试" in l and "重新" not in l)
+    start_btn.click()
+    at.run()
+
+    # 3 轮对话
+    at.chat_input[0].set_value("我做了 5 年 Python 后端")
+    at.run()
+    at.chat_input[0].set_value("做过订单系统")  # 短答,触发"过于简短"flag
+    at.run()
+    at.chat_input[0].set_value(f"暂时想到这些,{END_SIGNAL}")
+    at.run()
+
+    # 报告应已生成,含第 7 段
+    assert at.session_state["report_text"], "报告未生成"
+    assert "真实性" in at.session_state["report_text"]
+    assert "70" in at.session_state["report_text"]
+    assert "模板化" in at.session_state["report_text"]
+
+    # authenticity_report 也存进 session_state
+    auth = at.session_state["authenticity_report"]
+    assert auth is not None
+    assert auth.score == 0.7

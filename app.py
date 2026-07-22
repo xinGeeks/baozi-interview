@@ -27,6 +27,12 @@ from storage import (
     list_sessions,
     save_session,
 )
+from authenticity import (
+    AuthenticityReport,
+    build_authenticity_judgment_prompt,
+    detect_signals,
+    parse_authenticity_response,
+)
 
 
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
@@ -121,6 +127,9 @@ DEFAULTS = {
     "interview_started_at": None,   # datetime 对象,_start_interview 时记
     "viewing_history": False,       # True 时主区显示历史 session 只读视图
     "success_msg": "",              # 一次性提示(如"已保存到历史")
+    # v0.3 Feature E: 真实性检测
+    "turn_authenticity_flags": [],  # 每答一题追加一次:list[str],per-turn 启发式信号
+    "authenticity_report": None,    # AuthenticityReport 或 None(报告末尾 LLM 聚合结果)
     # 测试 hook:如果 setdefault 时已存在(mock_responses 不在 DEFAULTS 但 setdefault 不会创建),
     # 保留测试设置。Streamlit 每次 rerun 都会重新执行模块顶层,所以测试需要用
     # at.session_state[...] 显式注入(在 at.run() 之前或之后第一次 set_state)。
@@ -285,6 +294,14 @@ def _handle_user_answer(answer: str) -> None:
             last_question = msg["content"]
             break
 
+    # v0.3 Feature E: per-turn 启发式真实性信号检测(零 LLM 成本,<1ms)
+    flags = detect_signals(
+        question=last_question,
+        answer=answer,
+        resume_text=st.session_state.resume_content,
+    )
+    st.session_state.turn_authenticity_flags.append(flags)
+
     # 逐轮反馈(反馈 LLM 不流式,继续用 _do_chat 不带 stream)
     try:
         feedback_messages = [{
@@ -329,12 +346,25 @@ def _handle_user_answer(answer: str) -> None:
     st.session_state.chat_history.append({"role": "assistant", "content": next_q})
 
 
-def _render_feedback_card(fb: dict) -> None:
-    """渲染反馈小卡:📊 N/10 — advice(浅灰底,单行)。"""
+def _render_feedback_card(fb: dict, authenticity_flags: list[str] | None = None) -> None:
+    """渲染反馈小卡:📊 N/10 — advice(浅灰底,单行)+ 可选 ⚠️ 真实性提示。
+
+    authenticity_flags 非空时,追加一行 amber 底色的 flag 提示(最显眼的 1 个)。
+    flag-only,不修改分数 — 候选人有最终判断权。
+    """
     advice = (fb.get("advice") or "").replace("<", "&lt;").replace(">", "&gt;")
+    warn_html = ""
+    if authenticity_flags:
+        top_flag = authenticity_flags[0]
+        warn_html = (
+            f"<div style='background:#fff3cd;padding:4px 8px;border-radius:4px;"
+            f"font-size:0.8em;color:#856404;margin-top:4px'>"
+            f"⚠️ 真实性提示:{top_flag}</div>"
+        )
     st.markdown(
         f"<div style='background:#f0f2f6;padding:6px 10px;border-radius:6px;"
-        f"font-size:0.85em;color:#333'>📊 <b>{fb['score']}/10</b> — {advice}</div>",
+        f"font-size:0.85em;color:#333'>📊 <b>{fb['score']}/10</b> — {advice}</div>"
+        f"{warn_html}",
         unsafe_allow_html=True,
     )
 
@@ -411,6 +441,14 @@ def _generate_report() -> None:
     st.session_state.report_text = report
     st.session_state.interview_ended = True
 
+    # v0.3 Feature E: 报告末尾追加真实性维度(单次 LLM 聚合;失败不阻断主报告)
+    auth_report = _aggregate_authenticity()
+    if auth_report is not None and auth_report.is_valid:
+        st.session_state.authenticity_report = auth_report
+        section_7 = _render_authenticity_section(auth_report)
+        if section_7:
+            st.session_state.report_text = report + "\n\n" + section_7
+
     # 落盘(失败不阻断 UI,但记 error_msg;报告仍可读可下载)
     try:
         sid = save_session(
@@ -421,7 +459,7 @@ def _generate_report() -> None:
             resume_text=st.session_state.resume_content,
             chat_history=list(st.session_state.chat_history),
             turn_feedback=list(st.session_state.turn_feedback),
-            report_text=report,
+            report_text=st.session_state.report_text,
             started_at=(
                 st.session_state.interview_started_at
                 or datetime.now(timezone.utc)
@@ -431,6 +469,44 @@ def _generate_report() -> None:
         st.session_state.success_msg = f"💾 已保存到历史 (id: {sid})"
     except Exception as e:
         st.session_state.error_msg = f"报告已生成,但保存到历史失败:{e}"
+
+
+def _aggregate_authenticity() -> AuthenticityReport | None:
+    """报告生成时调一次 LLM 聚合启发式 signals → AuthenticityReport。
+
+    失败 → 返回 None(主报告照常出,UI 不显示真实性段)。
+    """
+    prompt = build_authenticity_judgment_prompt(
+        resume=st.session_state.resume_content,
+        jd=st.session_state.jd_content,
+        chat_history=list(st.session_state.chat_history),
+        turn_flags=list(st.session_state.turn_authenticity_flags),
+    )
+    try:
+        raw = _do_chat([{"role": "user", "content": prompt}], temperature=0.3)
+    except LLMError:
+        return None
+    return parse_authenticity_response(raw)
+
+
+def _render_authenticity_section(report: AuthenticityReport) -> str:
+    """生成报告「第 7 段 · 真实性维度」Markdown。失败/parse 错 → 空串(隐藏)。"""
+    if not report.is_valid:
+        return ""
+    score_pct = int(round(report.score * 100))
+    tone = "🟢" if score_pct >= 80 else ("🟡" if score_pct >= 60 else "🔴")
+    findings_md = "\n".join(
+        f"- **轮 {f.turn}** · {f.issue}:{f.detail}" for f in report.findings
+    ) or "- (无关键发现)"
+    summary = report.summary or "(无摘要)"
+    return f"""### 7. 真实性维度 {tone} {score_pct} 分
+
+**整体评估**:{summary}
+
+**关键发现**:
+{findings_md}
+
+> 注:真实性检测仅作参考,不构成录用判断。分数 = 简历 / JD / 回答三方一致性的启发式 + LLM 综合评估。"""
 
 
 # ============================================================================
@@ -522,7 +598,14 @@ else:
             if user_msg_seen < len(st.session_state.turn_feedback):
                 fb = st.session_state.turn_feedback[user_msg_seen]
                 if fb.get("score", -1) >= 0:
-                    _render_feedback_card(fb)
+                    flags = (
+                        st.session_state.turn_authenticity_flags[user_msg_seen]
+                        if user_msg_seen < len(
+                            st.session_state.turn_authenticity_flags
+                        )
+                        else []
+                    )
+                    _render_feedback_card(fb, authenticity_flags=flags)
             user_msg_seen += 1
 
 
