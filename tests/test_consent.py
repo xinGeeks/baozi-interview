@@ -13,7 +13,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 from storage import (
-    candidate_id_from_resume,
+    get_candidate_id,
     has_accepted_tos,
     init_db,
     record_consent,
@@ -29,7 +29,7 @@ class TestRecordConsent:
     def test_record_and_check_roundtrip(self, tmp_path: Path):
         db = tmp_path / "test.db"
         init_db(db)
-        cid = candidate_id_from_resume("张三 后端")
+        cid = get_candidate_id()
         assert has_accepted_tos(db, cid, "2026-07-22-v1") is False
         record_consent(db, cid, "2026-07-22-v1")
         assert has_accepted_tos(db, cid, "2026-07-22-v1") is True
@@ -38,7 +38,7 @@ class TestRecordConsent:
         """UNIQUE 约束 → 重复接受同一 version 不会报错。"""
         db = tmp_path / "test.db"
         init_db(db)
-        cid = candidate_id_from_resume("李四 前端")
+        cid = get_candidate_id()
         record_consent(db, cid, "v1")
         record_consent(db, cid, "v1")  # 不抛
         assert has_accepted_tos(db, cid, "v1") is True
@@ -46,34 +46,19 @@ class TestRecordConsent:
     def test_different_versions_independent(self, tmp_path: Path):
         db = tmp_path / "test.db"
         init_db(db)
-        cid = candidate_id_from_resume("王五 全栈")
+        cid = get_candidate_id()
         record_consent(db, cid, "v1")
         # 旧 version 仍被记录
         assert has_accepted_tos(db, cid, "v1") is True
         # 新 version 未接受
         assert has_accepted_tos(db, cid, "v2") is False
 
-    def test_different_candidates_independent(self, tmp_path: Path):
-        db = tmp_path / "test.db"
-        init_db(db)
-        record_consent(db, "c_aaa", "v1")
-        assert has_accepted_tos(db, "c_aaa", "v1") is True
-        assert has_accepted_tos(db, "c_bbb", "v1") is False
-
-    def test_default_candidate_when_empty_resume(self, tmp_path: Path):
-        """空简历 → candidate_id = 'default'。"""
-        db = tmp_path / "test.db"
-        init_db(db)
-        assert candidate_id_from_resume("") == "default"
-        record_consent(db, "default", "v1")
-        assert has_accepted_tos(db, "default", "v1") is True
-
     def test_explicit_accepted_at_respected(self, tmp_path: Path):
         db = tmp_path / "test.db"
         init_db(db)
         ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
-        record_consent(db, "c_x", "v1", accepted_at=ts)
-        assert has_accepted_tos(db, "c_x", "v1") is True
+        record_consent(db, get_candidate_id(), "v1", accepted_at=ts)
+        assert has_accepted_tos(db, get_candidate_id(), "v1") is True
 
 
 # ============================================================================

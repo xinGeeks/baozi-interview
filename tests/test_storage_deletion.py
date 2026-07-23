@@ -10,9 +10,9 @@ from pathlib import Path
 import pytest
 
 from storage import (
-    candidate_id_from_resume,
     clear_all_sessions_for_candidate,
     delete_session,
+    get_candidate_id,
     get_session,
     init_db,
     purge_expired_sessions,
@@ -29,7 +29,7 @@ def _make_session(
 ) -> str:
     """辅助:落盘一条 session(可指定 ended_at 和简历)。
 
-    candidate_id 自动从 resume_text 派生;调用方需要时再 candidate_id_from_resume。
+    单用户模式:resume_text 参数保留只为兼容旧调用,不影响 candidate_id。
     """
     started = (ended_at or datetime.now(timezone.utc)) - timedelta(minutes=10)
     sid = save_session(
@@ -94,24 +94,22 @@ class TestDeleteSession:
 
 
 class TestClearAllForCandidate:
-    def test_clear_only_target_candidate(self, tmp_path: Path):
+    def test_clear_clears_all_in_single_user_mode(self, tmp_path: Path):
+        """单用户模式:clear_all 清掉所有 default bucket 下的 session。"""
         from storage import list_sessions
         db = tmp_path / "test.db"
         init_db(db)
-        cid_a = candidate_id_from_resume("候选人 A 简历")
-        cid_b = candidate_id_from_resume("候选人 B 简历")
         _make_session(db, "候选人 A 简历")
         _make_session(db, "候选人 A 简历")
         _make_session(db, "候选人 B 简历")
-        n = clear_all_sessions_for_candidate(db, cid_a)
-        assert n == 2
-        # b 不应受影响
-        assert len(list_sessions(db, cid_b, limit=10)) == 1
+        n = clear_all_sessions_for_candidate(db, get_candidate_id())
+        assert n == 3
+        assert len(list_sessions(db, get_candidate_id(), limit=10)) == 0
 
     def test_clear_empty_candidate_returns_zero(self, tmp_path: Path):
         db = tmp_path / "test.db"
         init_db(db)
-        assert clear_all_sessions_for_candidate(db, "c_empty") == 0
+        assert clear_all_sessions_for_candidate(db, "default") == 0
 
 
 class TestPurgeExpired:
@@ -119,7 +117,6 @@ class TestPurgeExpired:
         from storage import list_sessions
         db = tmp_path / "test.db"
         init_db(db)
-        cid = candidate_id_from_resume("候选人 A 简历")
         # 100 天前
         old = datetime.now(timezone.utc) - timedelta(days=100)
         _make_session(db, "候选人 A 简历", ended_at=old)
@@ -129,19 +126,18 @@ class TestPurgeExpired:
         n = purge_expired_sessions(db, retention_days=30)
         assert n == 1
         # 今天的还在
-        assert len(list_sessions(db, cid, limit=10)) == 1
+        assert len(list_sessions(db, get_candidate_id(), limit=10)) == 1
 
     def test_purge_zero_days_disables(self, tmp_path: Path):
         """retention_days=0 → 不删(返回 0)。"""
         from storage import list_sessions
         db = tmp_path / "test.db"
         init_db(db)
-        cid = candidate_id_from_resume("候选人 A 简历")
         old = datetime.now(timezone.utc) - timedelta(days=1000)
         _make_session(db, "候选人 A 简历", ended_at=old)
         n = purge_expired_sessions(db, retention_days=0)
         assert n == 0
-        assert len(list_sessions(db, cid, limit=10)) == 1
+        assert len(list_sessions(db, get_candidate_id(), limit=10)) == 1
 
     def test_purge_negative_days_disables(self, tmp_path: Path):
         db = tmp_path / "test.db"

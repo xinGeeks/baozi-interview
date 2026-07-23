@@ -3,7 +3,7 @@
 设计原则:
 - 零新依赖(SQLite 是 stdlib)
 - 所有函数显式接受 db_path(测试友好,生产用 DEFAULT_DB_PATH)
-- 不存简历原文(PII 安全),只用 MD5 做 candidate_id
+- 单用户工具:所有 session 共用 candidate_id="default",不分简历
 - 单事务写 3 表,失败原子回滚
 - ON DELETE CASCADE 留接口给后续删除功能
 """
@@ -89,16 +89,30 @@ def _connect(db_path: Path | None = None) -> sqlite3.Connection:
 
 
 def init_db(db_path: Path | None = None) -> None:
-    """建表(幂等,IF NOT EXISTS)。db_path=None 时从 env 读。"""
+    """建表(幂等,IF NOT EXISTS)。db_path=None 时从 env 读。
+
+    v0.3: 单用户模式下,把历史上 c_* 格式的 candidate_id 收敛到 "default",
+    让 alpha 测试期落的数据仍可见(一次性,UPDATE 影响行数 = 0 后幂等)。
+    """
     with _connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        # 单用户迁移:旧 c_xxx → default
+        conn.execute(
+            "UPDATE interview_sessions SET candidate_id='default' "
+            "WHERE candidate_id LIKE 'c_%'"
+        )
+        conn.execute(
+            "UPDATE consent_log SET candidate_id='default' "
+            "WHERE candidate_id LIKE 'c_%'"
+        )
 
 
-def candidate_id_from_resume(resume_text: str) -> str:
-    """简历为空 → 'default';否则 'c_' + MD5 头 16 字符。"""
-    if not resume_text or not resume_text.strip():
-        return "default"
-    return "c_" + hashlib.md5(resume_text.encode("utf-8")).hexdigest()[:16]
+def get_candidate_id() -> str:
+    """返回当前 candidate_id。单用户工具固定 'default'(不再按简历切分)。
+
+    函数签名保留 `()` 而非常量的原因:未来若引入多用户切换,只改这一个函数。
+    """
+    return "default"
 
 
 def save_session(
@@ -119,7 +133,7 @@ def save_session(
         db_path = _default_db_path()
     ended_at = ended_at or datetime.now(timezone.utc)
     sid = uuid.uuid4().hex[:12]
-    cid = candidate_id_from_resume(resume_text)
+    cid = get_candidate_id()
     jd_hash = hashlib.md5(jd.encode("utf-8")).hexdigest()[:16]
     jd_summary = (
         (jd.strip()[:200] + "…") if len(jd.strip()) > 200 else jd.strip()

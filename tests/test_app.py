@@ -363,8 +363,208 @@ def test_chat_history_without_think_no_expander(configure_llm):
 
 
 # ============================================================================
-# v0.3 Feature A:每轮即时反馈
+# v0.3 alpha-kickoff fix:复盘报告渲染
+# - think 块折叠(同 chat 消息)
+# - 历史视图下不再与主报告区重复渲染
 # ============================================================================
+
+def test_report_with_think_shows_expander(configure_llm):
+    """report_text 含 <think> 块时,渲染应折叠到 expander 里(同 chat 消息行为)。"""
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
+    at.run()
+    at.session_state["report_text"] = (
+        "<think>内部评估:候选人回答偏弱</think>\n\n"
+        "## 1. 整体评价\n\n候选人表达清晰。"
+    )
+    at.run()
+
+    # 应出现"思考过程"expander(折叠收纳)
+    think_expanders = [e for e in at.expander if "思考" in (e.label or "")]
+    assert len(think_expanders) == 1
+    # visible 部分(标题 + 段落)照常渲染
+    md = "\n".join(m.value for m in at.markdown)
+    assert "整体评价" in md
+    assert "候选人表达清晰" in md
+
+
+def test_report_without_think_no_expander(configure_llm):
+    """report_text 不含 <think> 时,不应出现报告折叠 expander。"""
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
+    at.run()
+    at.session_state["report_text"] = "## 1. 整体评价\n\n候选人表达清晰。"
+    at.run()
+
+    # 报告区出现,但无 think expander
+    labels = [s.value for s in at.subheader if s.value]
+    assert any("面试复盘报告" in lbl for lbl in labels)
+    think_expanders = [e for e in at.expander if "思考" in (e.label or "")]
+    assert len(think_expanders) == 0
+
+
+def test_history_view_chat_think_folded(configure_llm, monkeypatch, tmp_path):
+    """历史对话视图里的 assistant 消息若含 <think>,也应折叠到 expander。"""
+    from datetime import datetime, timezone
+    from storage import init_db, save_session
+
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
+    at.run()
+
+    sid = save_session(
+        db_path=db_path,
+        level="P5",
+        style="严谨",
+        jd="Python 后端 JD",
+        resume_text="张三 简历",
+        chat_history=[
+            {"role": "user", "content": "自我介绍"},
+            {
+                "role": "assistant",
+                "content": (
+                    "<think>他在让我做自我介绍,先问项目</think>\n\n"
+                    "请介绍一下你自己和最有挑战的项目"
+                ),
+            },
+        ],
+        turn_feedback=[],
+        report_text="",
+        started_at=datetime.now(timezone.utc),
+    )
+
+    at.session_state["loaded_session_id"] = sid
+    at.session_state["viewing_history"] = True
+    at.run()
+
+    # 历史视图里应出现"思考过程"expander
+    think_expanders = [e for e in at.expander if "思考" in (e.label or "")]
+    assert len(think_expanders) == 1, (
+        f"历史对话视图应折叠 think 块,实际 expander 数:{len(think_expanders)}"
+    )
+    # visible 部分照常渲染
+    md = "\n".join(m.value for m in at.markdown)
+    assert "请介绍一下你自己" in md
+
+
+def test_history_view_does_not_duplicate_report(configure_llm, monkeypatch, tmp_path):
+    """进入历史会话视图时,主报告区不应再渲染同一份报告(避免重复展示)。"""
+    from datetime import datetime, timezone
+    from storage import init_db, save_session
+
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
+    at.run()
+
+    # 落一份历史(含报告)
+    sid = save_session(
+        db_path=db_path,
+        level="P5",
+        style="严谨",
+        jd="Python 后端 JD",
+        resume_text="张三 简历",
+        chat_history=[
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ],
+        turn_feedback=[],
+        report_text="## 1. 整体评价\n\n历史报告内容",
+        started_at=datetime.now(timezone.utc),
+    )
+
+    # 模拟"结束面试 → 主报告已渲染"的 state(report_text 已设)
+    at.session_state["report_text"] = "## 当前报告\n\n当前会话报告内容"
+    at.session_state["loaded_session_id"] = sid
+    at.session_state["viewing_history"] = True
+    at.run()
+
+    # 主区:不应出现「面试复盘报告」(只显示历史视图的「复盘报告」)
+    subheaders = [s.value for s in at.subheader if s.value]
+    main_report_titles = [s for s in subheaders if "面试复盘报告" in s]
+    history_report_titles = [s for s in subheaders if s.strip() == "📑 复盘报告"]
+    assert len(main_report_titles) == 0, (
+        f"主报告区不应渲染,实际 subheaders: {subheaders}"
+    )
+    assert len(history_report_titles) == 1, (
+        f"历史视图应渲染一份『复盘报告』,实际 subheaders: {subheaders}"
+    )
+
+    # markdown 池里:历史报告内容出现,当前会话报告内容不出现
+    md = "\n".join(m.value for m in at.markdown)
+    assert "历史报告内容" in md
+    assert "当前会话报告内容" not in md
+
+
+def test_delete_popover_confirm_removes_session(configure_llm, monkeypatch, tmp_path):
+    """🗑️ popover → 点「确认删除」→ session 删掉 + 成功提示渲染。
+
+    AppTest 把 popover body 内的按钮直接暴露在 at.sidebar.button(无需先
+    「打开」popover),所以可以直接定位 key=del_{sid} 的按钮并 click。
+    """
+    from datetime import datetime, timezone
+    from storage import get_session, init_db, save_session
+
+    db_path = tmp_path / "test.db"
+    init_db(db_path)
+    monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
+
+    at = AppTest.from_file("app.py", default_timeout=10)
+    at.session_state["tos_accepted"] = True
+    at.session_state["tos_check_done"] = True
+    at.run()
+
+    sid_target = save_session(
+        db_path=db_path, level="P5", style="严谨",
+        jd="JD A", resume_text="张三",
+        chat_history=[{"role": "user", "content": "q"},
+                      {"role": "assistant", "content": "a"}],
+        turn_feedback=[], report_text="r",
+        started_at=datetime.now(timezone.utc),
+    )
+    sid_keep = save_session(
+        db_path=db_path, level="P5", style="严谨",
+        jd="JD B", resume_text="李四",
+        chat_history=[{"role": "user", "content": "q"},
+                      {"role": "assistant", "content": "a"}],
+        turn_feedback=[], report_text="r",
+        started_at=datetime.now(timezone.utc),
+    )
+    at.run()
+
+    # popover body 里的「确认删除」按钮
+    del_btns = [
+        b for b in at.sidebar.button if b.key == f"del_{sid_target}"
+    ]
+    assert len(del_btns) == 1, (
+        f"popover body 里的「确认删除」按钮应渲染,实际: "
+        f"{[(b.label, b.key) for b in at.sidebar.button]}"
+    )
+
+    # 点确认删除
+    del_btns[0].click()
+    at.run()
+
+    # 1) DB 里 sid_target 已删,sid_keep 仍在
+    assert get_session(db_path, sid_target) is None
+    assert get_session(db_path, sid_keep) is not None
+
+    # 2) 成功提示渲染
+    success_messages = [s.value for s in at.success]
+    assert any("已删除" in m for m in success_messages), (
+        f"未看到删除成功提示,at.success: {success_messages}"
+    )
 
 def test_feedback_card_appears_after_user_message(configure_llm):
     """跑 2 轮对话,每轮 user message 后应出现反馈小卡。"""

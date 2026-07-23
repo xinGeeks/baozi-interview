@@ -33,9 +33,9 @@ from prompts import (
 )
 from resume_parser import ResumeParseError, parse_pdf_resume
 from storage import (
-    candidate_id_from_resume,
     clear_all_sessions_for_candidate,
     delete_session,
+    get_candidate_id,
     get_session,
     has_accepted_tos,
     init_db,
@@ -86,6 +86,28 @@ def _split_think_blocks(content: str) -> tuple[list[str], str]:
     thinks = THINK_RE.findall(content)
     visible = THINK_RE.sub("", content).strip()
     return thinks, visible
+
+
+def _render_message_body(content: str) -> None:
+    """渲染 LLM 输出正文(把 <think>...</think> 折叠到 expander 里)。
+
+    适用场景:chat 消息(主区 + 历史视图)+ 复盘报告(主区 + 历史视图)。
+    应在 st.chat_message 或页面流式上下文里调用,本身只负责 think 折叠 + visible 渲染。
+    """
+    thinks, visible = _split_think_blocks(content)
+    if thinks:
+        with st.expander(
+            f"🧠 思考过程 ({len(thinks)} 块)", expanded=False
+        ):
+            for i, t in enumerate(thinks, 1):
+                if len(thinks) > 1:
+                    st.markdown(f"**块 {i}**\n\n{t.strip()}")
+                else:
+                    st.markdown(t.strip())
+    if visible:
+        st.markdown(visible)
+
+
 
 
 # 测试 hook:monkeypatch app._do_chat 来替换 LLM。
@@ -364,7 +386,7 @@ with st.sidebar:
     st.divider()
     st.caption("📚 历史面试")
     try:
-        cid = candidate_id_from_resume(st.session_state.resume_content)
+        cid = get_candidate_id()
         history = list_sessions(None, cid, limit=5)
     except Exception:
         history = []
@@ -391,7 +413,9 @@ with st.sidebar:
                     st.session_state.viewing_history = True
                     st.rerun()
             with col_b:
-                # 单条删除(二次确认通过 popover)
+                # 单条删除:🗑️ popover 浮在按钮上方,二次确认。
+                # Streamlit 1.59.2 的 popover 跨 rerun 保持开关状态,所以确认后
+                # popover 仍打开(原生 UX);点击 popover 外部任意位置即可关闭。
                 with st.popover("🗑️"):
                     st.caption(
                         f"将永久删除 {h['ended_at'][:10]} 的 {h['turn_count']} 轮面试。"
@@ -428,10 +452,7 @@ with st.sidebar:
                 use_container_width=True,
             ):
                 try:
-                    _cid = candidate_id_from_resume(
-                        st.session_state.resume_content
-                    )
-                    n = clear_all_sessions_for_candidate(None, _cid)
+                    n = clear_all_sessions_for_candidate(None, get_candidate_id())
                     st.session_state.success_msg = (
                         f"🗑️ 已清空 {n} 条历史 session"
                     )
@@ -447,8 +468,9 @@ with st.sidebar:
 
 if not st.session_state.tos_check_done:
     try:
-        _cid = candidate_id_from_resume(st.session_state.resume_content)
-        st.session_state.tos_accepted = has_accepted_tos(None, _cid, TOS_VERSION)
+        st.session_state.tos_accepted = has_accepted_tos(
+            None, get_candidate_id(), TOS_VERSION
+        )
     except Exception:
         st.session_state.tos_accepted = False
     st.session_state.tos_check_done = True
@@ -477,8 +499,7 @@ if not st.session_state.tos_accepted:
             use_container_width=True,
         ):
             try:
-                _cid = candidate_id_from_resume(st.session_state.resume_content)
-                record_consent(None, _cid, TOS_VERSION)
+                record_consent(None, get_candidate_id(), TOS_VERSION)
                 st.session_state.tos_accepted = True
                 st.success("✅ 已接受 ToS,现在可以开始面试")
                 st.rerun()
@@ -672,7 +693,7 @@ def _render_history_view(session_id: str) -> None:
     for i, msg in enumerate(sess["turns"]):
         if msg["role"] == "assistant":
             with st.chat_message("assistant", avatar="👨‍🏫"):
-                st.markdown(msg["content"])
+                _render_message_body(msg["content"])
         else:
             with st.chat_message("user", avatar="🙋"):
                 st.markdown(msg["content"])
@@ -683,7 +704,7 @@ def _render_history_view(session_id: str) -> None:
     if sess.get("report_text"):
         st.divider()
         st.subheader("📑 复盘报告")
-        st.markdown(sess["report_text"])
+        _render_message_body(sess["report_text"])
         st.download_button(
             "💾 下载报告 (Markdown)",
             data=sess["report_text"],
@@ -854,18 +875,7 @@ else:
     for idx, msg in enumerate(st.session_state.chat_history):
         if msg["role"] == "assistant":
             with st.chat_message("assistant", avatar="👨‍🏫"):
-                thinks, visible = _split_think_blocks(msg["content"])
-                if thinks:
-                    with st.expander(
-                        f"🧠 思考过程 ({len(thinks)} 块)", expanded=False
-                    ):
-                        for i, t in enumerate(thinks, 1):
-                            if len(thinks) > 1:
-                                st.markdown(f"**块 {i}**\n\n{t.strip()}")
-                            else:
-                                st.markdown(t.strip())
-                if visible:
-                    st.markdown(visible)
+                _render_message_body(msg["content"])
         else:
             with st.chat_message("user", avatar="🙋"):
                 st.markdown(msg["content"])
@@ -910,10 +920,10 @@ if st.session_state.interview_started and not st.session_state.interview_ended:
 # 报告区
 # ============================================================================
 
-if st.session_state.report_text:
+if st.session_state.report_text and not st.session_state.viewing_history:
     st.divider()
     st.subheader("📑 面试复盘报告")
-    st.markdown(st.session_state.report_text)
+    _render_message_body(st.session_state.report_text)
     st.download_button(
         "💾 下载报告 (Markdown)",
         data=st.session_state.report_text,

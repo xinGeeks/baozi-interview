@@ -12,7 +12,7 @@ import pytest
 
 from storage import (
     DEFAULT_DB_PATH,
-    candidate_id_from_resume,
+    get_candidate_id,
     get_session,
     init_db,
     list_sessions,
@@ -71,26 +71,59 @@ def test_init_db_is_idempotent(tmp_path: Path):
 
 
 # ============================================================================
-# candidate_id_from_resume
+# get_candidate_id (单用户模式)
 # ============================================================================
 
-def test_candidate_id_from_empty_resume_returns_default():
-    assert candidate_id_from_resume("") == "default"
-    assert candidate_id_from_resume("   ") == "default"
-    assert candidate_id_from_resume(None or "") == "default"
+def test_get_candidate_id_returns_default():
+    """单用户工具:任何调用都返回 'default',不再按简历切分。"""
+    assert get_candidate_id() == "default"
 
 
-def test_candidate_id_from_resume_is_deterministic():
-    a = candidate_id_from_resume("张三 5年 Python 后端")
-    b = candidate_id_from_resume("张三 5年 Python 后端")
-    assert a == b
-    assert a.startswith("c_")
+def test_get_candidate_id_is_stable():
+    """多次调用一致(未来多用户切换只改这一个函数)。"""
+    assert get_candidate_id() == get_candidate_id() == "default"
 
 
-def test_candidate_id_differs_for_different_resumes():
-    a = candidate_id_from_resume("简历 A")
-    b = candidate_id_from_resume("简历 B")
-    assert a != b
+def test_init_db_migrates_legacy_c_prefix_to_default(tmp_path: Path):
+    """init_db 应把历史上 c_xxx 格式的 candidate_id 收敛到 'default'。"""
+    db = tmp_path / "test.db"
+    init_db(db)
+
+    # 直接插一行 c_xxx 模拟 alpha 测试期数据
+    import sqlite3
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "INSERT INTO interview_sessions "
+            "(id, candidate_id, started_at, ended_at, level, style, "
+            " jd_summary, jd_hash, score_avg, report_text, turn_count) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy_001", "c_legacyhash123", "2026-07-01T00:00:00+00:00",
+                "2026-07-01T00:30:00+00:00", "P5", "严谨", "jd", "h",
+                None, "report", 0,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO consent_log (candidate_id, tos_version, accepted_at) "
+            "VALUES (?, ?, ?)",
+            ("c_legacyhash123", "v1", "2026-07-01T00:00:00+00:00"),
+        )
+        conn.commit()
+
+    # 再调 init_db → 应触发迁移
+    init_db(db)
+
+    with sqlite3.connect(str(db)) as conn:
+        sess_cid = conn.execute(
+            "SELECT candidate_id FROM interview_sessions WHERE id=?",
+            ("legacy_001",),
+        ).fetchone()[0]
+        consent_cid = conn.execute(
+            "SELECT candidate_id FROM consent_log WHERE tos_version=?",
+            ("v1",),
+        ).fetchone()[0]
+    assert sess_cid == "default"
+    assert consent_cid == "default"
 
 
 # ============================================================================
@@ -211,16 +244,17 @@ def test_list_sessions_orders_by_ended_at_desc(db: Path):
     assert sessions[1]["id"] == sid_old
 
 
-def test_list_sessions_filters_by_candidate(db: Path):
+def test_list_sessions_single_user_returns_all(db: Path):
+    """单用户模式:不同简历的两场 session 应都列在 default bucket 下。"""
     chat, feedback, report = _sample_history()
-    save_session(
+    sid_a = save_session(
         db_path=db, level="校招", style="温和引导",
         jd="j", resume_text="简历 A",
         chat_history=chat, turn_feedback=feedback,
         report_text=report,
         started_at=datetime.now(timezone.utc),
     )
-    save_session(
+    sid_b = save_session(
         db_path=db, level="校招", style="温和引导",
         jd="j", resume_text="简历 B",
         chat_history=chat, turn_feedback=feedback,
@@ -228,11 +262,9 @@ def test_list_sessions_filters_by_candidate(db: Path):
         started_at=datetime.now(timezone.utc),
     )
 
-    a_sessions = list_sessions(db, candidate_id_from_resume("简历 A"))
-    b_sessions = list_sessions(db, candidate_id_from_resume("简历 B"))
-    assert len(a_sessions) == 1
-    assert len(b_sessions) == 1
-    assert a_sessions[0]["id"] != b_sessions[0]["id"]
+    sessions = list_sessions(db, get_candidate_id())
+    ids = {s["id"] for s in sessions}
+    assert {sid_a, sid_b} <= ids
 
 
 def test_list_sessions_respects_limit(db: Path):
