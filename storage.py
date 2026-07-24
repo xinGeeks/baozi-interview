@@ -75,6 +75,28 @@ CREATE TABLE IF NOT EXISTS consent_log (
     accepted_at     TEXT NOT NULL,
     UNIQUE(candidate_id, tos_version)
 );
+
+CREATE TABLE IF NOT EXISTS topic_facts (
+    sid             TEXT NOT NULL,
+    topic           TEXT NOT NULL,
+    score           REAL NOT NULL,
+    source_turn     INTEGER NOT NULL,
+    PRIMARY KEY (sid, topic, source_turn),
+    FOREIGN KEY (sid) REFERENCES interview_sessions(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_topic_facts_sid ON topic_facts(sid);
+
+CREATE TABLE IF NOT EXISTS candidate_topic_cache (
+    candidate_id    TEXT NOT NULL,
+    topic           TEXT NOT NULL,
+    score           REAL NOT NULL,
+    last_seen_at    TEXT NOT NULL,
+    PRIMARY KEY (candidate_id, topic)
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_topic_cid
+    ON candidate_topic_cache(candidate_id);
 """
 
 
@@ -342,3 +364,170 @@ def purge_expired_sessions(
             (cutoff_iso,),
         )
     return cur.rowcount
+
+
+# ============================================================================
+# Topic 抽取 + 跨 session 聚合(v0.3 Feature F)
+# ============================================================================
+
+# 延迟导入:topic_extraction 依赖 storage 的 TopicFact 倒过来会有循环引用风险。
+# storage 模块只导入 dataclass,不导入 extract_topics 函数本身,
+# extract_and_store_for_session 在函数体内延迟导入。
+from topic_extraction import TopicFact  # noqa: E402
+
+
+def write_topic_facts(
+    db_path: Path | None, sid: str, topics: list[TopicFact]
+) -> int:
+    """把 TopicFact 列表写入 topic_facts。INSERT OR IGNORE 幂等。
+
+    Returns:
+        写入行数(rowcount 不含被 IGNORE 跳过的)。
+    """
+    if db_path is None:
+        db_path = _default_db_path()
+    if not topics:
+        return 0
+    with _connect(db_path) as conn:
+        cur = conn.executemany(
+            """
+            INSERT OR IGNORE INTO topic_facts
+              (sid, topic, score, source_turn)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (sid, t.topic, t.score, t.source_turn)
+                for t in topics
+            ],
+        )
+    return cur.rowcount if cur else 0
+
+
+def write_candidate_topic_cache(
+    db_path: Path | None,
+    candidate_id: str,
+    topics: list[TopicFact],
+    last_seen_at: datetime | None = None,
+) -> int:
+    """UPSERT 写入 candidate_topic_cache。
+
+    同 (candidate_id, topic) 已存在 → 更新 score + last_seen_at。
+    不存在 → 插入。
+    score 取该 topic 在本次 batch 中的最大值(MVP 简化:避免累加失控)。
+    """
+    if db_path is None:
+        db_path = _default_db_path()
+    if not topics:
+        return 0
+    last_seen_at = last_seen_at or datetime.now(timezone.utc)
+    last_seen_iso = last_seen_at.isoformat()
+
+    # 取每个 topic 的最大 score(MVP 简化)
+    best: dict[str, float] = {}
+    for t in topics:
+        if t.topic not in best or t.score > best[t.topic]:
+            best[t.topic] = t.score
+
+    with _connect(db_path) as conn:
+        cur = conn.executemany(
+            """
+            INSERT INTO candidate_topic_cache
+              (candidate_id, topic, score, last_seen_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(candidate_id, topic) DO UPDATE SET
+              score = MAX(candidate_topic_cache.score, excluded.score),
+              last_seen_at = excluded.last_seen_at
+            """,
+            [
+                (candidate_id, topic, score, last_seen_iso)
+                for topic, score in best.items()
+            ],
+        )
+    return cur.rowcount if cur else 0
+
+
+def get_topics_for_candidate(
+    db_path: Path | None, candidate_id: str
+) -> list[TopicFact]:
+    """读 candidate_topic_cache,按 score DESC, topic ASC 排序。"""
+    if db_path is None:
+        db_path = _default_db_path()
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT topic, score FROM candidate_topic_cache
+            WHERE candidate_id = ?
+            ORDER BY score DESC, topic ASC
+            """,
+            (candidate_id,),
+        ).fetchall()
+    return [
+        TopicFact(topic=r["topic"], score=r["score"], source_turn=0)
+        for r in rows
+    ]
+
+
+def get_topic_trend(
+    db_path: Path | None, candidate_id: str, topic: str
+) -> list[tuple[str, float, str]]:
+    """读某 topic 在该 candidate 所有 session 中的得分趋势。
+
+    Returns:
+        [(session_id, score, ended_at), ...] 按 ended_at ASC 排序。
+        topic 未出现 → []。
+    """
+    if db_path is None:
+        db_path = _default_db_path()
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT tf.sid AS sid, tf.score AS score, s.ended_at AS ended_at
+            FROM topic_facts tf
+            JOIN interview_sessions s ON s.id = tf.sid
+            WHERE s.candidate_id = ? AND tf.topic = ?
+            ORDER BY s.ended_at ASC
+            """,
+            (candidate_id, topic),
+        ).fetchall()
+    return [(r["sid"], r["score"], r["ended_at"]) for r in rows]
+
+
+def extract_and_store_for_session(
+    db_path: Path | None, sid: str, candidate_id: str
+) -> int:
+    """一站式:从 session 取 turns → 抽取 topics → 写两张表。
+
+    失败隔离:函数体内 try/except,失败返回 0(不抛),调用方 catch 兜底。
+    Returns:
+        写入 candidate_topic_cache 的行数(去重后)。
+    """
+    if db_path is None:
+        db_path = _default_db_path()
+    try:
+        from topic_extraction import extract_topics  # 延迟导入避免循环
+
+        sess = get_session(db_path, sid)
+        if sess is None:
+            return 0
+        turns = [
+            {"role": t["role"], "content": t["content"]}
+            for t in sess.get("turns", [])
+        ]
+        topics = extract_topics(turns)
+        if not topics:
+            return 0
+        # 写两张表(topic_facts 持久事实 + cache 聚合)
+        write_topic_facts(db_path, sid, topics)
+        # cache 用 session 的 ended_at 当 last_seen_at(语义:最近出现)
+        ended_at = sess.get("ended_at")
+        last_seen = None
+        if isinstance(ended_at, str):
+            try:
+                last_seen = datetime.fromisoformat(ended_at)
+            except ValueError:
+                last_seen = None
+        return write_candidate_topic_cache(
+            db_path, candidate_id, topics, last_seen_at=last_seen
+        )
+    except Exception:
+        return 0

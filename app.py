@@ -4,11 +4,14 @@
 """
 from __future__ import annotations
 
+import html
 import re
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pandas as pd
 
 import streamlit as st
 
@@ -35,8 +38,11 @@ from resume_parser import ResumeParseError, parse_pdf_resume
 from storage import (
     clear_all_sessions_for_candidate,
     delete_session,
+    extract_and_store_for_session,
     get_candidate_id,
     get_session,
+    get_topic_trend,
+    get_topics_for_candidate,
     has_accepted_tos,
     init_db,
     list_sessions,
@@ -50,6 +56,7 @@ from authenticity import (
     detect_signals,
     parse_authenticity_response,
 )
+from topic_extraction import TopicFact
 
 
 THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
@@ -305,6 +312,39 @@ for k, v in DEFAULTS.items():
 
 
 # ============================================================================
+# Topic 可视化 helpers(v0.3 Feature F)
+# 必须放在 sidebar 之前定义,否则 module top-level 执行时 NameError
+# ============================================================================
+
+
+def _topic_cloud_html(topics: list[TopicFact]) -> str:
+    """渲染 topic cloud:HTML <span> chips,字号 = 12 + score * 24。
+
+    Top-1/3 用 emerald 色突出;其余用默认灰。空列表 → 空串。
+    所有 topic 字符串经 html.escape 防 XSS。
+    """
+    if not topics:
+        return ""
+    sorted_topics = sorted(
+        topics, key=lambda t: (-t.score, t.topic)
+    )
+    cutoff = max(1, len(sorted_topics) // 3)
+    chips: list[str] = []
+    for i, t in enumerate(sorted_topics):
+        size = 12 + t.score * 24
+        color = "#10b981" if i < cutoff else "#374151"
+        bg = "#ecfdf5" if i < cutoff else "#f3f4f6"
+        chips.append(
+            f"<span style='display:inline-block;margin:2px 4px;"
+            f"padding:2px 8px;background:{bg};color:{color};"
+            f"font-size:{size:.1f}px;border-radius:10px;"
+            f"font-weight:{'600' if i < cutoff else '400'}'>"
+            f"{html.escape(t.topic)}</span>"
+        )
+    return "<div style='line-height:2'>" + "".join(chips) + "</div>"
+
+
+# ============================================================================
 # 侧边栏:简历 / 职级 / 风格
 # ============================================================================
 
@@ -459,6 +499,89 @@ with st.sidebar:
                     st.rerun()
                 except Exception as e:
                     st.error(f"清空失败:{e}")
+
+    # v0.3 Feature F: 跨会话训练图谱(折叠 expander,默认折叠)
+    # 主题云 + 趋势条形图;空态提示用户完成第 2 场后会自动出现
+    with st.expander("🎯 跨会话训练图谱", expanded=False):
+        try:
+            topics = get_topics_for_candidate(None, get_candidate_id())
+        except Exception:
+            topics = []
+        if not topics:
+            st.caption("暂无跨 session 数据,完成第 2 场后会自动出现。")
+        else:
+            st.markdown(
+                "**训练主题云**(字号越大 = 反复出现且占比越高):",
+                help="主题 = 多场面试反复提到的关键词汇,已脱敏处理。",
+            )
+            st.markdown(_topic_cloud_html(topics), unsafe_allow_html=True)
+            st.divider()
+            st.caption("**Top-10 主题得分**(基于训练频次归一化):")
+            top10 = topics[:10]
+            # 显式 DataFrame 让 x 接受 topic 字符串列(避免 list 直接传 x 的版本警告)
+            chart_df = pd.DataFrame(
+                {
+                    "topic": [t.topic for t in top10],
+                    "score": [t.score for t in top10],
+                }
+            ).set_index("topic")
+            try:
+                st.bar_chart(
+                    data=chart_df,
+                    y="score",
+                    height=240,
+                )
+            except Exception:
+                # 旧版 Streamlit:用 dict 形式
+                st.bar_chart(
+                    {"score": [t.score for t in top10]},
+                    height=240,
+                )
+            # v0.3 Feature F Phase 2:per-topic trend list(按钮点开画线)
+            # 复用 history 的 button+session_state+rerun 模式;懒查询 get_topic_trend
+            st.divider()
+            st.caption("🔍 按主题查趋势(点击展开):")
+            for t in topics:
+                is_open = st.session_state.get("trend_open_topic") == t.topic
+                btn_label = f"{'▼' if is_open else '▶'} {t.topic}"
+                if st.button(
+                    btn_label,
+                    key=f"trend_{t.topic}",
+                    use_container_width=True,
+                ):
+                    st.session_state["trend_open_topic"] = (
+                        None if is_open else t.topic
+                    )
+                    st.rerun()
+            trend_topic = st.session_state.get("trend_open_topic")
+            if trend_topic:
+                with st.container():
+                    try:
+                        trend = get_topic_trend(
+                            None, get_candidate_id(), trend_topic
+                        )
+                    except Exception:
+                        trend = []
+                    if len(trend) < 2:
+                        st.caption(
+                            f"⚠️ 仅 {len(trend)} 场会话,需要 ≥ 2 场才能画趋势。"
+                        )
+                    else:
+                        # ISO datetime -> date prefix (前 10 字符) 用于 x 轴
+                        trend_chart_df = pd.DataFrame(
+                            {"score": [round(s, 4) for _, s, _ in trend]},
+                            index=[
+                                ended_at[:10] for _, _, ended_at in trend
+                            ],
+                        ).rename_axis("session_date")
+                        try:
+                            st.line_chart(
+                                trend_chart_df, y="score", height=200
+                            )
+                        except Exception:
+                            st.line_chart(
+                                [s for _, s, _ in trend], height=200
+                            )
 
 
 # ============================================================================
@@ -763,6 +886,23 @@ def _generate_report() -> None:
         )
         st.session_state.current_session_id = sid
         st.session_state.success_msg = f"💾 已保存到历史 (id: {sid})"
+
+        # v0.3 Feature F: 跨会话 topic 抽取(失败 best-effort,不阻断 UI)
+        # 失败时记录到 error.log;UI 继续显示报告 + 不弹错误条
+        try:
+            extract_and_store_for_session(None, sid, get_candidate_id())
+        except Exception as _e:
+            try:
+                _ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with _ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
+                    f.write(
+                        f"[{datetime.now(timezone.utc).isoformat()}] "
+                        f"extract_and_store_for_session: "
+                        f"{type(_e).__name__}: {str(_e)[:200]}\n"
+                        f"{'-' * 60}\n"
+                    )
+            except Exception:
+                pass  # log 失败也吞掉,主流程不挂
     except Exception as e:
         st.session_state.error_msg = f"报告已生成,但保存到历史失败:{e}"
 
