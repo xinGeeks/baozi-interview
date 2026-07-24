@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS interview_sessions (
     jd_hash         TEXT NOT NULL,
     score_avg       REAL,
     report_text     TEXT NOT NULL,
-    turn_count      INTEGER NOT NULL
+    turn_count      INTEGER NOT NULL,
+    mode            TEXT NOT NULL DEFAULT 'interview'
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_candidate
@@ -115,6 +116,8 @@ def init_db(db_path: Path | None = None) -> None:
 
     v0.3: 单用户模式下,把历史上 c_* 格式的 candidate_id 收敛到 "default",
     让 alpha 测试期落的数据仍可见(一次性,UPDATE 影响行数 = 0 后幂等)。
+    v0.3 Feature Practice: 给 interview_sessions 加 mode 列(幂等 ALTER TABLE),
+    已有行 backfill 为 'interview'。
     """
     with _connect(db_path) as conn:
         conn.executescript(SCHEMA)
@@ -127,6 +130,18 @@ def init_db(db_path: Path | None = None) -> None:
             "UPDATE consent_log SET candidate_id='default' "
             "WHERE candidate_id LIKE 'c_%'"
         )
+        # Feature Practice 迁移:加 mode 列(老 DB 才有)
+        cols = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info('interview_sessions')"
+            ).fetchall()
+        }
+        if "mode" not in cols:
+            conn.execute(
+                "ALTER TABLE interview_sessions ADD COLUMN mode "
+                "TEXT NOT NULL DEFAULT 'interview'"
+            )
 
 
 def get_candidate_id() -> str:
@@ -149,8 +164,15 @@ def save_session(
     report_text: str,
     started_at: datetime,
     ended_at: datetime | None = None,
+    mode: str = "interview",
 ) -> str:
-    """落盘一场完整面试,返回 session_id。单事务 3 表。"""
+    """落盘一场完整面试,返回 session_id。单事务 3 表。
+
+    Args:
+        mode: 'interview'(正常面试)或 'practice'(弱 topic 专项练习)。
+            practice 模式的 session 不会被 extract_and_store_for_session 抽取
+            到 candidate_topic_cache,避免练习 transcript 反向污染训练图谱。
+    """
     if db_path is None:
         db_path = _default_db_path()
     ended_at = ended_at or datetime.now(timezone.utc)
@@ -173,13 +195,13 @@ def save_session(
             """
             INSERT INTO interview_sessions
               (id, candidate_id, started_at, ended_at, level, style,
-               jd_summary, jd_hash, score_avg, report_text, turn_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               jd_summary, jd_hash, score_avg, report_text, turn_count, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sid, cid, started_at.isoformat(), ended_at.isoformat(),
                 level, style, jd_summary, jd_hash, score_avg, report_text,
-                len(user_turns),
+                len(user_turns), mode,
             ),
         )
         conn.executemany(
@@ -212,23 +234,42 @@ def save_session(
 
 
 def list_sessions(
-    db_path: Path | None, candidate_id: str, *, limit: int = 5
+    db_path: Path | None, candidate_id: str, *,
+    limit: int = 5,
+    mode: str | None = None,
 ) -> list[dict]:
-    """返回该 candidate 最近 N 场(按 ended_at DESC)。"""
+    """返回该 candidate 最近 N 场(按 ended_at DESC)。
+
+    Args:
+        mode: None=全部, 'interview'=只看正常面试, 'practice'=只看练习。
+    """
     if db_path is None:
         db_path = _default_db_path()
     with _connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, started_at, ended_at, level, style,
-                   jd_summary, score_avg, turn_count
-            FROM interview_sessions
-            WHERE candidate_id = ?
-            ORDER BY ended_at DESC
-            LIMIT ?
-            """,
-            (candidate_id, limit),
-        ).fetchall()
+        if mode is None:
+            rows = conn.execute(
+                """
+                SELECT id, started_at, ended_at, level, style,
+                       jd_summary, score_avg, turn_count, mode
+                FROM interview_sessions
+                WHERE candidate_id = ?
+                ORDER BY ended_at DESC
+                LIMIT ?
+                """,
+                (candidate_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, started_at, ended_at, level, style,
+                       jd_summary, score_avg, turn_count, mode
+                FROM interview_sessions
+                WHERE candidate_id = ? AND mode = ?
+                ORDER BY ended_at DESC
+                LIMIT ?
+                """,
+                (candidate_id, mode, limit),
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -508,6 +549,10 @@ def extract_and_store_for_session(
 
         sess = get_session(db_path, sid)
         if sess is None:
+            return 0
+        # mode=='practice' 的 session 跳过抽取,
+        # 防止练习 transcript 反向污染 candidate_topic_cache 训练图谱
+        if sess.get("mode") == "practice":
             return 0
         turns = [
             {"role": t["role"], "content": t["content"]}

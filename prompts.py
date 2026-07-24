@@ -95,6 +95,8 @@ def build_interviewer_system_prompt(
     style: str,
     resume: str,
     jd: str,
+    *,
+    focus_context: str | None = None,
 ) -> str:
     """构造面试官系统 prompt,主对话循环每轮都带。
 
@@ -103,6 +105,9 @@ def build_interviewer_system_prompt(
         style: 2 风格之一
         resume: 简历文本(允许为空)
         jd: 岗位 JD(允许为空)
+        focus_context: 弱 topic 专项训练模式下的焦点主题字符串。
+            非 None 时,在 prompt 末尾(开场白之前)注入『[专项训练模式]』块,
+            强制面试官围绕该主题深挖;None 时不注入(向后兼容)。
     """
     if level not in LEVELS:
         raise ValueError(f"未知职级:{level!r},必须是 {LEVELS} 之一")
@@ -114,6 +119,16 @@ def build_interviewer_system_prompt(
         else "用户未上传简历,仅根据 JD 通用提问。"
     )
     jd_section = jd.strip() if jd and jd.strip() else "(用户未填写 JD)"
+
+    focus_block = ""
+    if focus_context:
+        focus_block = f"""
+
+## [专项训练模式] 当前焦点主题:「{focus_context}」
+
+请围绕该主题深挖:基础概念 → 典型场景 → 踩过的坑 → 与简历的交叉验证。
+若候选人主动偏题可顺势切换,但每 ≥3 轮显式关联一次本主题,确保训练密度。
+"""
 
     return f"""你是一名经验丰富的【面试教练】,正在进行一对一真实模拟面试,帮助求职者练习和提升。
 
@@ -146,7 +161,7 @@ def build_interviewer_system_prompt(
 7. 全程口语化、真实化,不生硬、不机械化、不使用『这是一个好问题』这类客套。
 8. 当用户输入包含『{END_SIGNAL}』关键词时,立即停止提问,回复一句简短结束语
    (例如:『好的,本场模拟面试到此结束。稍后我会给你生成一份详细的复盘报告。』)，
-   不再追问任何问题。
+   不再追问任何问题。{focus_block}
 
 ## 开场白
 第一次对话时,以『请简单介绍一下你自己』作为开场。

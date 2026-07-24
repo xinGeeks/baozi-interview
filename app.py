@@ -303,6 +303,9 @@ DEFAULTS = {
     "tos_accepted": False,          # 当前 candidate_id + TOS_VERSION 是否接受
     "tos_check_done": False,        # 是否已查过 DB(避免每次 rerun 都查)
     "token_counter": None,          # DailyTokenCounter(懒初始化,见 _token_counter)
+    # v0.3 Feature Practice: 弱 topic 专项练习模式
+    "practice_mode": False,         # True 时启用专项训练 prompt 注入
+    "practice_topic": "",           # 当前专项训练焦点主题
     # 测试 hook:如果 setdefault 时已存在(mock_responses 不在 DEFAULTS 但 setdefault 不会创建),
     # 保留测试设置。Streamlit 每次 rerun 都会重新执行模块顶层,所以测试需要用
     # at.session_state[...] 显式注入(在 at.run() 之前或之后第一次 set_state)。
@@ -427,7 +430,7 @@ with st.sidebar:
     st.caption("📚 历史面试")
     try:
         cid = get_candidate_id()
-        history = list_sessions(None, cid, limit=5)
+        history = list_sessions(None, cid, limit=5, mode="interview")
     except Exception:
         history = []
 
@@ -475,8 +478,54 @@ with st.sidebar:
                         except Exception as e:
                             st.error(f"删除失败:{e}")
 
-        # 批量清空按钮(强制输入"确认删除")
-        with st.expander("⚠️ 清空我的全部历史", expanded=False):
+    # 练习记录(弱 topic 专项练习);独立 subsection,不论 interview 历史是否有都显示
+    try:
+        practice_history = list_sessions(
+            None, cid, limit=5, mode="practice"
+        )
+    except Exception:
+        practice_history = []
+    if practice_history:
+        with st.expander(
+            f"🎯 练习记录 ({len(practice_history)})", expanded=False
+        ):
+            for h in practice_history:
+                label = (
+                    f"{h['ended_at'][:10]} · {h['level']} · "
+                    f"{h['turn_count']} 轮"
+                )
+                col_a, col_b = st.columns([4, 1])
+                with col_a:
+                    if st.button(
+                        label,
+                        key=f"prac_{h['id']}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.loaded_session_id = h["id"]
+                        st.session_state.viewing_history = True
+                        st.rerun()
+                with col_b:
+                    with st.popover("🗑️"):
+                        st.caption(
+                            f"将永久删除 {h['ended_at'][:10]} 的练习记录。"
+                        )
+                        if st.button(
+                            "确认删除",
+                            key=f"prac_del_{h['id']}",
+                            type="secondary",
+                            use_container_width=True,
+                        ):
+                            try:
+                                delete_session(None, h["id"])
+                                st.session_state.success_msg = (
+                                    f"🗑️ 已删除 {h['ended_at'][:10]} 的练习记录"
+                                )
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"删除失败:{e}")
+
+    # 批量清空按钮(强制输入"确认删除")
+    with st.expander("⚠️ 清空我的全部历史", expanded=False):
             st.caption(
                 f"将永久删除你的全部 {len(history)} 条历史 session。"
             )
@@ -583,6 +632,47 @@ with st.sidebar:
                                 [s for _, s, _ in trend], height=200
                             )
 
+    # v0.3 Feature Practice: 弱 topic 专项练习入口
+    # 从 candidate_topic_cache top-N 取候选,每个一个 button 启动专项训练
+    with st.expander("🎯 弱 topic 专项练习", expanded=False):
+        if st.session_state.get("practice_mode"):
+            st.caption(
+                f"**进行中** · 焦点主题:「{st.session_state.practice_topic}」"
+            )
+            st.caption(
+                "退出请用主区『🚪 退出专项训练』按钮,"
+                "或输入『退出专项训练』结束。"
+            )
+        else:
+            st.caption(
+                "高频主题 = 反复提到,优先练。"
+                "分数 = 训练图谱中的提及占比,**不代表掌握度**。"
+            )
+            try:
+                practice_topics = get_topics_for_candidate(
+                    None, get_candidate_id()
+                )[:8]
+            except Exception:
+                practice_topics = []
+            if not practice_topics:
+                st.caption(
+                    "📭 暂无候选主题。先完成 1-2 场面试,主题出现在"
+                    "『跨会话训练图谱』后再来。"
+                )
+            else:
+                for t in practice_topics:
+                    if st.button(
+                        f"📍 {t.topic}",
+                        key=f"practice_entry_{t.topic}",
+                        use_container_width=True,
+                    ):
+                        st.session_state.practice_mode = True
+                        st.session_state.practice_topic = t.topic
+                        # exit_viewing_history 兜底:确保不在历史只读模式
+                        st.session_state.viewing_history = False
+                        st.session_state.loaded_session_id = ""
+                        st.rerun()
+
 
 # ============================================================================
 # ToS 接受闸门(v0.3 alpha-kickoff)
@@ -649,17 +739,26 @@ st.session_state.jd_content = st.text_area(
 # ============================================================================
 
 def _system_prompt() -> str:
+    focus = (
+        st.session_state.practice_topic
+        if st.session_state.get("practice_mode") else None
+    )
     return build_interviewer_system_prompt(
         level=st.session_state.interview_level,
         style=st.session_state.interview_style,
         resume=st.session_state.resume_content,
         jd=st.session_state.jd_content,
+        focus_context=focus,
     )
 
 
 def _start_interview() -> None:
-    """点击『开始面试』:清空历史 + 流式生成第一题。"""
-    if not st.session_state.jd_content.strip():
+    """点击『开始面试』:清空历史 + 流式生成第一题。
+
+    practice_mode=True 时跳过 JD 非空校验(focus_context 替代 JD 提供训练方向)。
+    """
+    is_practice = st.session_state.get("practice_mode", False)
+    if not is_practice and not st.session_state.jd_content.strip():
         st.session_state.error_msg = "请先粘贴 JD 再开始面试"
         return
     st.session_state.chat_history = []
@@ -883,6 +982,7 @@ def _generate_report() -> None:
                 st.session_state.interview_started_at
                 or datetime.now(timezone.utc)
             ),
+            mode="practice" if st.session_state.get("practice_mode") else "interview",
         )
         st.session_state.current_session_id = sid
         st.session_state.success_msg = f"💾 已保存到历史 (id: {sid})"
@@ -905,6 +1005,17 @@ def _generate_report() -> None:
                 pass  # log 失败也吞掉,主流程不挂
     except Exception as e:
         st.session_state.error_msg = f"报告已生成,但保存到历史失败:{e}"
+
+
+# v0.3 Feature Practice: sidebar practice 按钮点击后,本 trigger 自动启动面试
+# 仅触发一次(因 _start_interview 设 interview_started=True,下次 rerun 跳过)
+if (
+    st.session_state.get("practice_mode")
+    and not st.session_state.interview_started
+    and not st.session_state.viewing_history
+):
+    _start_interview()
+    # 不 st.rerun():让本次 rerun 继续渲染 chat 区域(第一题),UX 流畅
 
 
 def _aggregate_authenticity() -> AuthenticityReport | None:
@@ -983,6 +1094,27 @@ with ctrl_r:
     else:
         st.caption("状态:未开始")
 
+# v0.3 Feature Practice: 专项训练专用退出按钮
+# 仅在 practice_mode=True 且面试进行中时渲染
+if (
+    st.session_state.get("practice_mode")
+    and st.session_state.interview_started
+    and not st.session_state.interview_ended
+):
+    st.caption(
+        f"🎯 专项训练:「{st.session_state.practice_topic}」"
+    )
+    if st.button(
+        "🚪 退出专项训练",
+        key="exit_practice",
+        type="secondary",
+        use_container_width=True,
+    ):
+        _generate_report()  # 与正常结束同一路径
+        st.session_state.practice_mode = False
+        st.session_state.practice_topic = ""
+        st.rerun()
+
 
 # ============================================================================
 # 错误提示
@@ -1046,13 +1178,25 @@ if st.session_state.interview_started and not st.session_state.interview_ended:
             "可结束面试并生成报告,或等到 UTC 0 点重置。"
         )
     user_input = st.chat_input(
-        "输入你的回答 (含『结束面试』可提前结束)",
+        "输入你的回答 (含『结束面试』可提前结束)"
+        + (
+            " 或『退出专项训练』可结束本次专项训练"
+            if st.session_state.get("practice_mode") else ""
+        ),
         disabled=_budget_blocked,
     )
     if user_input and not _budget_blocked:
         _handle_user_answer(user_input)
         if END_SIGNAL in user_input:
             _generate_report()
+        # v0.3 Feature Practice: 输入退出信号 → 同 END_SIGNAL 路径 + 切回普通模式
+        elif (
+            st.session_state.get("practice_mode")
+            and "退出专项训练" in user_input
+        ):
+            _generate_report()
+            st.session_state.practice_mode = False
+            st.session_state.practice_topic = ""
         st.rerun()
 
 
