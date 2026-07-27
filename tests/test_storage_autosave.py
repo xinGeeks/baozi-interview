@@ -154,7 +154,6 @@ def test_save_complex_serializable_payload(tmp_path: Path):
             {"question": "q1", "score": 7, "advice": "用 STAR"},
             {"question": "q2", "score": 9, "advice": "数据支撑好"},
         ],
-        "practice_mode": False,
         "interview_level": "社招(高级)",
     }
     save_autosave(db, cid, state)

@@ -9,14 +9,12 @@ LLM 调用 hook、面试状态机与渲染 helper。
 """
 from __future__ import annotations
 
-import html
 import re
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 import prompts
@@ -40,15 +38,11 @@ from prompts import (
     build_report_prompt,
 )
 from storage import (
-    backfill_topics_for_candidate,
     clear_all_sessions_for_candidate,
     clear_autosave,
     delete_session,
-    extract_and_store_for_session,
     get_candidate_id,
     get_session,
-    get_topic_trend,
-    get_topics_for_candidate,
     init_db,
     list_sessions,
     load_autosave,
@@ -62,10 +56,11 @@ from authenticity import (
     detect_signals,
     parse_authenticity_response,
 )
-from topic_extraction import TopicFact
 
 
-THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+THINK_RE = re.compile(r"%(OPEN)s(.*?)%(CLOSE)s" % {"OPEN": "<think>", "CLOSE": "</think>"}, re.DOTALL)
+
+
 
 
 _ERROR_LOG_PATH = Path(__file__).parent / "data" / "error.log"
@@ -79,7 +74,6 @@ PAGE_PATHS = {
     "config": "pages/config.py",
     "interview": "pages/interview.py",
     "report": "pages/report.py",
-    "topics": "pages/topics.py",
 }
 
 
@@ -148,13 +142,10 @@ DEFAULTS = {
     "authenticity_report": None,    # AuthenticityReport 或 None(报告末尾 LLM 聚合结果)
     # v0.3 alpha-kickoff: 成本
     "token_counter": None,          # DailyTokenCounter(懒初始化,见 _token_counter)
-    # v0.3 Feature Practice: 弱 topic 专项练习模式
-    "practice_mode": False,         # True 时启用专项训练 prompt 注入
-    "practice_topic": "",           # 当前专项训练焦点主题
     # v0.3 multipage-navigation
-    "current_page": "config",       # "config" | "interview" | "report" | "topics"
+    "current_page": "config",       # "config" | "interview" | "report"
     "pending_goto": "",             # 延迟跳转目标;由 _consume_nav 在页顶消费
-    "pending_start": False,         # config/topics 点开始后 → interview 页 auto-start 标记
+    "pending_start": False,         # config 点开始后 → interview 页 auto-start 标记
     "pending_report_nav": False,    # 面试结束后 → interview 页顶部跳报告页标记
     # 测试 hook:mock_responses / mock_feedback_responses 不在 DEFAULTS,
     # 测试用 at.session_state[...] 显式注入(setdefault 不会覆盖已存在的键)。
@@ -180,8 +171,6 @@ AUTOSAVE_KEYS = [
     "interview_style",
     "jd_content",
     "resume_content",
-    "practice_mode",
-    "practice_topic",
     "interview_started_at",
 ]
 
@@ -301,12 +290,12 @@ def _render_resume_prompt(*, target: str) -> bool:
 
 
 # ============================================================================
-# <think> 折叠渲染
+#  折叠渲染
 # ============================================================================
 
 
 def _split_think_blocks(content: str) -> tuple[list[str], str]:
-    """把 <think>...</think> 块从 LLM 输出中拆出来。
+    """把 ... 块从 LLM 输出中拆出来。
 
     Returns:
         (think_blocks, visible_content): 块列表 + 移除 think 后的可见内容(已 strip)
@@ -317,7 +306,7 @@ def _split_think_blocks(content: str) -> tuple[list[str], str]:
 
 
 def _render_message_body(content: str) -> None:
-    """渲染 LLM 输出正文(把 <think>...</think> 折叠到 expander 里)。"""
+    """渲染 LLM 输出正文(把 ... 折叠到 expander 里)。"""
     thinks, visible = _split_think_blocks(content)
     if thinks:
         with st.expander(f"🧠 思考过程 ({len(thinks)} 块)", expanded=False):
@@ -438,58 +427,25 @@ def _user_friendly_error(e: LLMError) -> str:
 
 
 # ============================================================================
-# Topic 可视化 helper(v0.3 Feature F)
-# ============================================================================
-
-
-def _topic_cloud_html(topics: list[TopicFact]) -> str:
-    """渲染 topic cloud:HTML <span> chips,字号 = 12 + score * 24。"""
-    if not topics:
-        return ""
-    sorted_topics = sorted(topics, key=lambda t: (-t.score, t.topic))
-    cutoff = max(1, len(sorted_topics) // 3)
-    chips: list[str] = []
-    for i, t in enumerate(sorted_topics):
-        size = 12 + t.score * 24
-        color = "#10b981" if i < cutoff else "#374151"
-        bg = "#ecfdf5" if i < cutoff else "#f3f4f6"
-        chips.append(
-            f"<span style='display:inline-block;margin:2px 4px;"
-            f"padding:2px 8px;background:{bg};color:{color};"
-            f"font-size:{size:.1f}px;border-radius:10px;"
-            f"font-weight:{'600' if i < cutoff else '400'}'>"
-            f"{html.escape(t.topic)}</span>"
-        )
-    return "<div style='line-height:2'>" + "".join(chips) + "</div>"
-
-
-# ============================================================================
 # 面试状态机
 # ============================================================================
 
 
 def _system_prompt() -> str:
-    focus = (
-        st.session_state.practice_topic
-        if st.session_state.get("practice_mode") else None
-    )
     return build_interviewer_system_prompt(
         level=st.session_state.interview_level,
         style=st.session_state.interview_style,
         resume=st.session_state.resume_content,
         jd=st.session_state.jd_content,
-        focus_context=focus,
     )
 
 
 def _start_interview() -> None:
     """开始面试:清空历史 + 流式生成第一题。
 
-    practice_mode=True 时跳过 JD 非空校验(focus_context 替代 JD 提供训练方向)。
     在 pages/interview.py 的 auto-start trigger 里调用,流式渲染落在面试页。
     """
-    is_practice = st.session_state.get("practice_mode", False)
-    if not is_practice and not st.session_state.jd_content.strip():
+    if not st.session_state.jd_content.strip():
         st.session_state.error_msg = "请先粘贴 JD 再开始面试"
         return
     st.session_state.chat_history = []
@@ -577,7 +533,7 @@ def _handle_user_answer(answer: str, *, generate_next: bool = True) -> None:
         })
 
     if not generate_next:
-        _autosave_interview()  # END_SIGNAL / 退出专项训练分支:答完即写盘
+        _autosave_interview()  # END_SIGNAL 分支:答完即写盘
         return
 
     messages = [{"role": "system", "content": _system_prompt()}] + list(
@@ -752,26 +708,9 @@ def _generate_report() -> None:
                 st.session_state.interview_started_at
                 or datetime.now(timezone.utc)
             ),
-            mode="practice" if st.session_state.get("practice_mode") else "interview",
         )
         st.session_state.current_session_id = sid
         st.session_state.success_msg = f"💾 已保存到历史 (id: {sid})"
-
-        # Feature F: 跨会话 topic 抽取(失败 best-effort,不阻断 UI)
-        try:
-            extract_and_store_for_session(None, sid, get_candidate_id())
-        except Exception as _e:
-            try:
-                _ERROR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-                with _ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
-                    f.write(
-                        f"[{datetime.now(timezone.utc).isoformat()}] "
-                        f"extract_and_store_for_session: "
-                        f"{type(_e).__name__}: {str(_e)[:200]}\n"
-                        f"{'-' * 60}\n"
-                    )
-            except Exception:
-                pass
         # 面试完成 → 草稿作废(防止下次开 app 误出续答 banner)
         _clear_autosave()
     except Exception as e:

@@ -55,7 +55,6 @@ pg = st.navigation([
     st.Page("pages/config.py", title="配置", icon="⚙️", default=True),
     st.Page("pages/interview.py", title="面试", icon="💬"),
     st.Page("pages/report.py", title="报告", icon="📑"),
-    st.Page("pages/topics.py", title="训练图谱", icon="🎯"),
 ])
 
 

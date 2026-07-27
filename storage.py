@@ -39,8 +39,7 @@ CREATE TABLE IF NOT EXISTS interview_sessions (
     jd_hash         TEXT NOT NULL,
     score_avg       REAL,
     report_text     TEXT NOT NULL,
-    turn_count      INTEGER NOT NULL,
-    mode            TEXT NOT NULL DEFAULT 'interview'
+    turn_count      INTEGER NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_candidate
@@ -71,28 +70,6 @@ CREATE TABLE IF NOT EXISTS turn_feedback (
 CREATE INDEX IF NOT EXISTS idx_feedback_session
     ON turn_feedback(session_id, turn_idx);
 
-CREATE TABLE IF NOT EXISTS topic_facts (
-    sid             TEXT NOT NULL,
-    topic           TEXT NOT NULL,
-    score           REAL NOT NULL,
-    source_turn     INTEGER NOT NULL,
-    PRIMARY KEY (sid, topic, source_turn),
-    FOREIGN KEY (sid) REFERENCES interview_sessions(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_topic_facts_sid ON topic_facts(sid);
-
-CREATE TABLE IF NOT EXISTS candidate_topic_cache (
-    candidate_id    TEXT NOT NULL,
-    topic           TEXT NOT NULL,
-    score           REAL NOT NULL,
-    last_seen_at    TEXT NOT NULL,
-    PRIMARY KEY (candidate_id, topic)
-);
-
-CREATE INDEX IF NOT EXISTS idx_candidate_topic_cid
-    ON candidate_topic_cache(candidate_id);
-
 CREATE TABLE IF NOT EXISTS interview_autosave (
     candidate_id    TEXT PRIMARY KEY,
     state_json      TEXT NOT NULL,
@@ -116,8 +93,6 @@ def init_db(db_path: Path | None = None) -> None:
 
     v0.3: 单用户模式下,把历史上 c_* 格式的 candidate_id 收敛到 "default",
     让 alpha 测试期落的数据仍可见(一次性,UPDATE 影响行数 = 0 后幂等)。
-    v0.3 Feature Practice: 给 interview_sessions 加 mode 列(幂等 ALTER TABLE),
-    已有行 backfill 为 'interview'。
     """
     with _connect(db_path) as conn:
         conn.executescript(SCHEMA)
@@ -126,18 +101,6 @@ def init_db(db_path: Path | None = None) -> None:
             "UPDATE interview_sessions SET candidate_id='default' "
             "WHERE candidate_id LIKE 'c_%'"
         )
-        # Feature Practice 迁移:加 mode 列(老 DB 才有)
-        cols = {
-            row["name"]
-            for row in conn.execute(
-                "PRAGMA table_info('interview_sessions')"
-            ).fetchall()
-        }
-        if "mode" not in cols:
-            conn.execute(
-                "ALTER TABLE interview_sessions ADD COLUMN mode "
-                "TEXT NOT NULL DEFAULT 'interview'"
-            )
 
 
 def get_candidate_id() -> str:
@@ -160,15 +123,8 @@ def save_session(
     report_text: str,
     started_at: datetime,
     ended_at: datetime | None = None,
-    mode: str = "interview",
 ) -> str:
-    """落盘一场完整面试,返回 session_id。单事务 3 表。
-
-    Args:
-        mode: 'interview'(正常面试)或 'practice'(弱 topic 专项练习)。
-            practice 模式的 session 不会被 extract_and_store_for_session 抽取
-            到 candidate_topic_cache,避免练习 transcript 反向污染训练图谱。
-    """
+    """落盘一场完整面试,返回 session_id。单事务 3 表。"""
     if db_path is None:
         db_path = _default_db_path()
     ended_at = ended_at or datetime.now(timezone.utc)
@@ -191,13 +147,13 @@ def save_session(
             """
             INSERT INTO interview_sessions
               (id, candidate_id, started_at, ended_at, level, style,
-               jd_summary, jd_hash, score_avg, report_text, turn_count, mode)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               jd_summary, jd_hash, score_avg, report_text, turn_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sid, cid, started_at.isoformat(), ended_at.isoformat(),
                 level, style, jd_summary, jd_hash, score_avg, report_text,
-                len(user_turns), mode,
+                len(user_turns),
             ),
         )
         conn.executemany(
@@ -232,40 +188,22 @@ def save_session(
 def list_sessions(
     db_path: Path | None, candidate_id: str, *,
     limit: int = 5,
-    mode: str | None = None,
 ) -> list[dict]:
-    """返回该 candidate 最近 N 场(按 ended_at DESC)。
-
-    Args:
-        mode: None=全部, 'interview'=只看正常面试, 'practice'=只看练习。
-    """
+    """返回该 candidate 最近 N 场(按 ended_at DESC)。"""
     if db_path is None:
         db_path = _default_db_path()
     with _connect(db_path) as conn:
-        if mode is None:
-            rows = conn.execute(
-                """
-                SELECT id, started_at, ended_at, level, style,
-                       jd_summary, score_avg, turn_count, mode
-                FROM interview_sessions
-                WHERE candidate_id = ?
-                ORDER BY ended_at DESC
-                LIMIT ?
-                """,
-                (candidate_id, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                """
-                SELECT id, started_at, ended_at, level, style,
-                       jd_summary, score_avg, turn_count, mode
-                FROM interview_sessions
-                WHERE candidate_id = ? AND mode = ?
-                ORDER BY ended_at DESC
-                LIMIT ?
-                """,
-                (candidate_id, mode, limit),
-            ).fetchall()
+        rows = conn.execute(
+            """
+            SELECT id, started_at, ended_at, level, style,
+                   jd_summary, score_avg, turn_count
+            FROM interview_sessions
+            WHERE candidate_id = ?
+            ORDER BY ended_at DESC
+            LIMIT ?
+            """,
+            (candidate_id, limit),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -412,202 +350,3 @@ def purge_expired_sessions(
             (cutoff_iso,),
         )
     return cur.rowcount
-
-
-# ============================================================================
-# Topic 抽取 + 跨 session 聚合(v0.3 Feature F)
-# ============================================================================
-
-# 延迟导入:topic_extraction 依赖 storage 的 TopicFact 倒过来会有循环引用风险。
-# storage 模块只导入 dataclass,不导入 extract_topics 函数本身,
-# extract_and_store_for_session 在函数体内延迟导入。
-from topic_extraction import TopicFact  # noqa: E402
-
-
-def write_topic_facts(
-    db_path: Path | None, sid: str, topics: list[TopicFact]
-) -> int:
-    """把 TopicFact 列表写入 topic_facts。INSERT OR IGNORE 幂等。
-
-    Returns:
-        写入行数(rowcount 不含被 IGNORE 跳过的)。
-    """
-    if db_path is None:
-        db_path = _default_db_path()
-    if not topics:
-        return 0
-    with _connect(db_path) as conn:
-        cur = conn.executemany(
-            """
-            INSERT OR IGNORE INTO topic_facts
-              (sid, topic, score, source_turn)
-            VALUES (?, ?, ?, ?)
-            """,
-            [
-                (sid, t.topic, t.score, t.source_turn)
-                for t in topics
-            ],
-        )
-    return cur.rowcount if cur else 0
-
-
-def write_candidate_topic_cache(
-    db_path: Path | None,
-    candidate_id: str,
-    topics: list[TopicFact],
-    last_seen_at: datetime | None = None,
-) -> int:
-    """UPSERT 写入 candidate_topic_cache。
-
-    同 (candidate_id, topic) 已存在 → 更新 score + last_seen_at。
-    不存在 → 插入。
-    score 取该 topic 在本次 batch 中的最大值(MVP 简化:避免累加失控)。
-    """
-    if db_path is None:
-        db_path = _default_db_path()
-    if not topics:
-        return 0
-    last_seen_at = last_seen_at or datetime.now(timezone.utc)
-    last_seen_iso = last_seen_at.isoformat()
-
-    # 取每个 topic 的最大 score(MVP 简化)
-    best: dict[str, float] = {}
-    for t in topics:
-        if t.topic not in best or t.score > best[t.topic]:
-            best[t.topic] = t.score
-
-    with _connect(db_path) as conn:
-        cur = conn.executemany(
-            """
-            INSERT INTO candidate_topic_cache
-              (candidate_id, topic, score, last_seen_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(candidate_id, topic) DO UPDATE SET
-              score = MAX(candidate_topic_cache.score, excluded.score),
-              last_seen_at = excluded.last_seen_at
-            """,
-            [
-                (candidate_id, topic, score, last_seen_iso)
-                for topic, score in best.items()
-            ],
-        )
-    return cur.rowcount if cur else 0
-
-
-def get_topics_for_candidate(
-    db_path: Path | None, candidate_id: str
-) -> list[TopicFact]:
-    """读 candidate_topic_cache,按 score DESC, topic ASC 排序。"""
-    if db_path is None:
-        db_path = _default_db_path()
-    with _connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT topic, score FROM candidate_topic_cache
-            WHERE candidate_id = ?
-            ORDER BY score DESC, topic ASC
-            """,
-            (candidate_id,),
-        ).fetchall()
-    return [
-        TopicFact(topic=r["topic"], score=r["score"], source_turn=0)
-        for r in rows
-    ]
-
-
-def get_topic_trend(
-    db_path: Path | None, candidate_id: str, topic: str
-) -> list[tuple[str, float, str]]:
-    """读某 topic 在该 candidate 所有 session 中的得分趋势。
-
-    Returns:
-        [(session_id, score, ended_at), ...] 按 ended_at ASC 排序。
-        topic 未出现 → []。
-    """
-    if db_path is None:
-        db_path = _default_db_path()
-    with _connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT tf.sid AS sid, tf.score AS score, s.ended_at AS ended_at
-            FROM topic_facts tf
-            JOIN interview_sessions s ON s.id = tf.sid
-            WHERE s.candidate_id = ? AND tf.topic = ?
-            ORDER BY s.ended_at ASC
-            """,
-            (candidate_id, topic),
-        ).fetchall()
-    return [(r["sid"], r["score"], r["ended_at"]) for r in rows]
-
-
-def backfill_topics_for_candidate(
-    db_path: Path | None, candidate_id: str
-) -> int:
-    """为尚无 topic_facts 的历史普通面试补做 topic 抽取。"""
-    if db_path is None:
-        db_path = _default_db_path()
-    with _connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT s.id
-            FROM interview_sessions s
-            WHERE s.candidate_id = ?
-              AND s.mode = 'interview'
-              AND NOT EXISTS (
-                  SELECT 1 FROM topic_facts tf WHERE tf.sid = s.id
-              )
-            ORDER BY s.ended_at ASC
-            """,
-            (candidate_id,),
-        ).fetchall()
-
-    processed = 0
-    for row in rows:
-        if extract_and_store_for_session(db_path, row["id"], candidate_id) > 0:
-            processed += 1
-    return processed
-
-
-def extract_and_store_for_session(
-    db_path: Path | None, sid: str, candidate_id: str
-) -> int:
-    """一站式:从 session 取 turns → 抽取 topics → 写两张表。
-
-    失败隔离:函数体内 try/except,失败返回 0(不抛),调用方 catch 兜底。
-    Returns:
-        写入 candidate_topic_cache 的行数(去重后)。
-    """
-    if db_path is None:
-        db_path = _default_db_path()
-    try:
-        from topic_extraction import extract_topics  # 延迟导入避免循环
-
-        sess = get_session(db_path, sid)
-        if sess is None:
-            return 0
-        # mode=='practice' 的 session 跳过抽取,
-        # 防止练习 transcript 反向污染 candidate_topic_cache 训练图谱
-        if sess.get("mode") == "practice":
-            return 0
-        turns = [
-            {"role": t["role"], "content": t["content"]}
-            for t in sess.get("turns", [])
-        ]
-        topics = extract_topics(turns)
-        if not topics:
-            return 0
-        # 写两张表(topic_facts 持久事实 + cache 聚合)
-        write_topic_facts(db_path, sid, topics)
-        # cache 用 session 的 ended_at 当 last_seen_at(语义:最近出现)
-        ended_at = sess.get("ended_at")
-        last_seen = None
-        if isinstance(ended_at, str):
-            try:
-                last_seen = datetime.fromisoformat(ended_at)
-            except ValueError:
-                last_seen = None
-        return write_candidate_topic_cache(
-            db_path, candidate_id, topics, last_seen_at=last_seen
-        )
-    except Exception:
-        return 0

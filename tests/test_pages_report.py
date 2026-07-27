@@ -58,7 +58,6 @@ def test_current_report_renders_download_and_explicit_navigation(tmp_path: Path)
     assert any("本场报告" in str(m.value) for m in at.markdown)
     assert len(at.download_button) == 1
     assert _button_by_label(at, "下一场") is not None
-    assert _button_by_label(at, "查看训练图谱") is not None
     assert at.session_state["current_page"] == "report"
 
 
@@ -107,13 +106,3 @@ def test_next_session_requests_config_navigation(tmp_path: Path):
     assert at.session_state["current_page"] == "config"
     assert at.session_state["interview_started"] is False
     assert at.session_state["report_text"] == ""
-
-
-def test_topics_button_requests_topics_navigation(tmp_path: Path):
-    at = _report_page(tmp_path / "report.db", report_text="# 本场报告")
-    button = _button_by_label(at, "查看训练图谱")
-    assert button is not None
-    button.click()
-    at.run()
-
-    assert at.session_state["current_page"] == "topics"

@@ -122,10 +122,7 @@ if st.button("🚀 开始面试", type="primary", use_container_width=True):
         st.session_state.error_msg = "请先粘贴 JD 再开始面试"
         st.rerun()
     else:
-        # 普通面试:清练习状态,置 pending_start,跳面试页 auto-start
         st.session_state.error_msg = ""
-        st.session_state.practice_mode = False
-        st.session_state.practice_topic = ""
         st.session_state.viewing_history = False
         st.session_state.loaded_session_id = ""
         st.session_state.pending_start = True

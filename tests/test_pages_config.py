@@ -4,7 +4,6 @@
 - 渲染:简历上传 / JD / 等级 / 风格 / 预算 / 开始按钮
 - 校验:JD 空 → 报错 + 不跳页
 - 跳页:JD 填入 → 点开始 → 置 pending_start + request_nav("interview")
-- 取消练习状态:从 practice 返回时重置相关 flag
 
 导航策略:统一从 app.py entry 进入,at.switch_page("pages/xxx.py") 跳页。
 这样 st.switch_page 的路径解析(相对 main script)是正确的;直接 from_file
@@ -177,31 +176,6 @@ class TestConfigValidation:
         )
         assert len(at.session_state["chat_history"]) >= 1
         assert at.session_state["chat_history"][-1]["role"] == "assistant"
-
-    def test_start_resets_practice_state(self, tmp_path: Path):
-        """从 practice 返回 config 后点开始,应清 practice_mode/topic。"""
-        db = tmp_path / "test.db"
-        at = _config_page(db)
-        at.session_state["practice_mode"] = True
-        at.session_state["practice_topic"] = "kafka"
-        at.session_state["viewing_history"] = True
-        at.session_state["loaded_session_id"] = "old_sid"
-        at.session_state["mock_responses"] = ["q1"]
-        jd_ta = next(
-            (t for t in at.text_area if "JD" in (t.label or "")), None
-        )
-        jd_ta.set_value("Python 后端 JD")
-        at.run()
-
-        btn = _button_by_label(at, "开始面试")
-        btn.click()
-        at.run()
-
-        # practice 状态被清
-        assert at.session_state["practice_mode"] is False
-        assert at.session_state["practice_topic"] == ""
-        assert at.session_state["viewing_history"] is False
-        assert at.session_state["loaded_session_id"] == ""
 
 
 # ============================================================================

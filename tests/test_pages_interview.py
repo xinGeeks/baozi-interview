@@ -5,7 +5,6 @@
 - 启动:pending_start + auto-start 链路
 - 交互:提交回答 → 反馈 + 追问
 - 结束:END_SIGNAL / 显式结束按钮 → generation_report + 跳报告页
-- practice mode:不同标题 / 退出按钮 / 退出专项训练 文本信号
 - 错误处理:LLMError 透传到 error_msg
 - 预占:未开始 → 引导回 config + st.stop()
 """
@@ -20,7 +19,6 @@ from streamlit.testing.v1 import AppTest
 
 from prompts import END_SIGNAL
 from storage import init_db, save_session
-from tests.conftest import FakeLLM
 
 
 # ============================================================================
@@ -32,8 +30,6 @@ def _interview(
     db_path: Path,
     *,
     interview_started: bool = True,
-    practice_mode: bool = False,
-    practice_topic: str = "",
     chat_history: list[dict] | None = None,
     turn_feedback: list[dict] | None = None,
     turn_authenticity_flags: list[list[str]] | None = None,
@@ -55,8 +51,6 @@ def _interview(
     at.run()
     at.switch_page("pages/interview.py")
     at.session_state["interview_started"] = interview_started
-    at.session_state["practice_mode"] = practice_mode
-    at.session_state["practice_topic"] = practice_topic
     at.session_state["chat_history"] = chat_history or []
     at.session_state["turn_feedback"] = turn_feedback or []
     at.session_state["turn_authenticity_flags"] = turn_authenticity_flags or []
@@ -91,36 +85,10 @@ class TestInterviewPageRender:
             f"期望『面试对话』标题,实际: {titles}"
         )
 
-    def test_practice_title_renders(self, tmp_path: Path):
-        at = _interview(
-            tmp_path / "test.db",
-            practice_mode=True,
-            practice_topic="kafka",
-        )
-        titles = [t.value for t in at.title]
-        assert any("专项训练" in t for t in titles), (
-            f"practice 应显示『专项训练』标题,实际: {titles}"
-        )
-        captions = [c.value for c in at.caption]
-        assert any("kafka" in c for c in captions), (
-            f"practice 应显示焦点主题,实际: {captions}"
-        )
-
     def test_normal_shows_end_button(self, tmp_path: Path):
         at = _interview(tmp_path / "test.db")
         btn = _button_by_label(at, "结束面试")
         assert btn is not None, "正常模式应显示结束面试按钮"
-
-    def test_practice_shows_exit_button(self, tmp_path: Path):
-        at = _interview(
-            tmp_path / "test.db",
-            practice_mode=True,
-            practice_topic="kafka",
-        )
-        btn = _button_by_label(at, "退出专项训练")
-        assert btn is not None, "practice 模式应显示退出专项训练按钮"
-        # 不应再显示结束面试按钮
-        assert _button_by_label(at, "结束面试") is None
 
     def test_chat_input_present(self, tmp_path: Path):
         at = _interview(tmp_path / "test.db")
@@ -193,7 +161,6 @@ class TestPendingStartAutoStart:
         last = at.session_state["chat_history"][-1]
         assert last["role"] == "assistant"
         assert "第一题" in last["content"]
-
 
 # ============================================================================
 # 对话交互
@@ -366,10 +333,8 @@ class TestFeedbackRendering:
 
 
 class TestPersistence:
-    def test_report_saved_to_db_with_correct_mode(
-        self, tmp_path: Path, monkeypatch
-    ):
-        """结束面试 → save_session 落盘(mode=interview)。"""
+    def test_report_saved_to_db(self, tmp_path: Path, monkeypatch):
+        """结束面试 → save_session 落盘(基本字段)。"""
         db = tmp_path / "test.db"
         at = _interview(
             db,
@@ -385,56 +350,11 @@ class TestPersistence:
 
         with sqlite3.connect(str(db)) as conn:
             rows = conn.execute(
-                "SELECT mode, level, turn_count FROM interview_sessions"
+                "SELECT level, turn_count FROM interview_sessions"
             ).fetchall()
         assert len(rows) == 1
-        assert rows[0][0] == "interview"
-        assert rows[0][1] == "社招(中级)"
-        assert rows[0][2] == 1
-
-    def test_practice_report_saved_with_mode_practice(self, tmp_path: Path):
-        """practice 模式结束 → mode='practice'。"""
-        db = tmp_path / "test.db"
-        at = _interview(
-            db,
-            practice_mode=True,
-            practice_topic="kafka",
-            chat_history=[
-                {"role": "assistant", "content": "q1"},
-                {"role": "user", "content": "a1"},
-            ],
-            mock_responses=["## 复盘报告"],
-        )
-        btn = _button_by_label(at, "退出专项训练")
-        btn.click()
-        at.run()
-
-        with sqlite3.connect(str(db)) as conn:
-            row = conn.execute(
-                "SELECT mode FROM interview_sessions"
-            ).fetchone()
-        assert row[0] == "practice"
-
-    def test_practice_exit_via_text_signal(self, tmp_path: Path):
-        """输入含『退出专项训练』→ 报告生成 + 跳转。"""
-        db = tmp_path / "test.db"
-        at = _interview(
-            db,
-            practice_mode=True,
-            practice_topic="kafka",
-            chat_history=[
-                {"role": "assistant", "content": "q1"},
-                {"role": "user", "content": "a1"},
-            ],
-            mock_responses=["## 复盘报告"],
-            timeout=120,
-        )
-        at.chat_input[0].set_value("好的,退出专项训练")
-        at.run()
-
-        assert at.session_state["report_text"], "报告未生成"
-        assert at.session_state["practice_mode"] is False
-        assert at.session_state["practice_topic"] == ""
+        assert rows[0][0] == "社招(中级)"
+        assert rows[0][1] == 1
 
     def test_resume_text_not_persisted(self, tmp_path: Path):
         """简历原文不应落盘(只存 hash)。"""

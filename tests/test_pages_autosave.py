@@ -67,8 +67,6 @@ def _seed_autosave(db_path: Path, *, turns: int = 2, resume: str = "张三 5 年
         "interview_style": "温和引导",
         "jd_content": "Python 后端 JD",
         "resume_content": resume,
-        "practice_mode": False,
-        "practice_topic": "",
         "interview_started_at": "2026-07-20T00:00:00+00:00",
     }
     save_autosave(db_path, get_candidate_id(), state)
@@ -275,8 +273,6 @@ class TestAutosaveTrigger:
                 "interview_style": at.session_state["interview_style"],
                 "jd_content": at.session_state["jd_content"],
                 "resume_content": at.session_state["resume_content"],
-                "practice_mode": False,
-                "practice_topic": "",
                 "interview_started_at": "2026-07-20T00:00:00+00:00",
             },
         )

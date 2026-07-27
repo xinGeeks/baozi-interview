@@ -2,7 +2,7 @@
 
 覆盖 v0.3 multipage-navigation 拆页后 entry 的剩余职责:
 - 全局 sidebar:清空全部历史 expander
-- st.navigation 声明 4 页(default=config)
+- st.navigation 声明 3 页(default=config)
 
 ToS 系统已移除(2026-07),此处不再覆盖 ToS 闸门相关行为。
 """
@@ -79,23 +79,23 @@ class TestNavigation:
             "DEFAULTS 应默认 current_page='config'"
         )
 
-    def test_page_paths_dict_has_four_pages(self):
-        """PAGE_PATHS 应声明 4 页。"""
+    def test_page_paths_dict_has_three_pages(self):
+        """PAGE_PATHS 应声明 3 页。"""
         from interview_helpers import PAGE_PATHS
         assert set(PAGE_PATHS.keys()) == {
-            "config", "interview", "report", "topics",
-        }, f"PAGE_PATHS keys 应恰好 4 项,实际: {list(PAGE_PATHS.keys())}"
+            "config", "interview", "report",
+        }, f"PAGE_PATHS keys 应恰好 3 项,实际: {list(PAGE_PATHS.keys())}"
 
     def test_no_page_specific_render_in_entry(self, tmp_path: Path):
-        """entry 不应残留 page-specific 渲染(标题不应是『面试对话』/『训练图谱』等)。"""
+        """entry 不应残留 page-specific 渲染(标题不应是『面试对话』等)。"""
         db = tmp_path / "test.db"
         at = _entry(db)
         titles = [t.value for t in at.title]
-        # 应是 config 标题,不是 interview/topics/report 标题
+        # 应是 config 标题,不是 interview/report 标题
         assert any("配置面试" in t for t in titles)
         assert not any(
             kw in t for t in titles
-            for kw in ("面试对话", "面试复盘报告", "训练图谱")
+            for kw in ("面试对话", "面试复盘报告")
         ), f"entry 不应渲染 page-specific 标题,实际: {titles}"
 
 

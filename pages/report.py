@@ -1,7 +1,7 @@
-"""报告页:本场报告 / 历史报告 切换 + 下一场 / 训练图谱 跳转。
+"""报告页:本场报告 / 历史报告 切换 + 下一场 跳转。
 
-流程第 3 页。面试结束后落在这里。不自动跳走 —— 用户显式点『下一场』或
-『查看训练图谱』离开。历史只读视图整合在『历史报告』段。
+流程第 3 页。面试结束后落在这里。不自动跳走 —— 用户显式点『下一场』
+离开。历史只读视图整合在『历史报告』段。
 """
 from __future__ import annotations
 
@@ -54,35 +54,24 @@ if seg == "本场报告":
             mime="text/markdown",
         )
         st.divider()
-        col_next, col_topics = st.columns(2)
-        with col_next:
-            if st.button(
-                "➡️ 下一场",
-                type="primary",
-                use_container_width=True,
-                key="report_next_session",
-            ):
-                # 重置本场状态,回配置页
-                st.session_state.chat_history = []
-                st.session_state.turn_feedback = []
-                st.session_state.turn_authenticity_flags = []
-                st.session_state.interview_started = False
-                st.session_state.interview_ended = False
-                st.session_state.report_text = ""
-                st.session_state.authenticity_report = None
-                st.session_state.current_session_id = ""
-                st.session_state.loaded_session_id = ""
-                st.session_state.viewing_history = False
-                st.session_state.practice_mode = False
-                st.session_state.practice_topic = ""
-                request_nav("config")
-        with col_topics:
-            if st.button(
-                "🎯 查看训练图谱",
-                use_container_width=True,
-                key="report_topics_nav",
-            ):
-                request_nav("topics")
+        if st.button(
+            "➡️ 下一场",
+            type="primary",
+            use_container_width=True,
+            key="report_next_session",
+        ):
+            # 重置本场状态,回配置页
+            st.session_state.chat_history = []
+            st.session_state.turn_feedback = []
+            st.session_state.turn_authenticity_flags = []
+            st.session_state.interview_started = False
+            st.session_state.interview_ended = False
+            st.session_state.report_text = ""
+            st.session_state.authenticity_report = None
+            st.session_state.current_session_id = ""
+            st.session_state.loaded_session_id = ""
+            st.session_state.viewing_history = False
+            request_nav("config")
     else:
         st.info("还没有本场报告。先到『配置』页开始一场面试。")
         if st.button("← 去配置页", key="goto_config_from_report"):
@@ -114,9 +103,8 @@ else:
                     if h.get("score_avg") is not None
                     else ""
                 )
-                mode_badge = "🎯 练习 · " if h.get("mode") == "practice" else ""
                 label = (
-                    f"{mode_badge}{h['ended_at'][:10]} · {h['level']} · "
+                    f"{h['ended_at'][:10]} · {h['level']} · "
                     f"{h['turn_count']} 轮{score_str}"
                 )
                 col_view, col_del = st.columns([6, 1])
