@@ -40,6 +40,7 @@ from prompts import (
     build_report_prompt,
 )
 from storage import (
+    backfill_topics_for_candidate,
     clear_all_sessions_for_candidate,
     clear_autosave,
     delete_session,

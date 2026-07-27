@@ -11,6 +11,7 @@ import streamlit as st
 from interview_helpers import (
     _consume_nav,
     _topic_cloud_html,
+    backfill_topics_for_candidate,
     get_candidate_id,
     get_topic_trend,
     get_topics_for_candidate,
@@ -25,6 +26,11 @@ st.session_state.current_page = "topics"
 
 st.title("🎯 训练图谱")
 st.caption("看你反复练什么、反复弱什么;点主题可直接专项深挖。")
+
+try:
+    backfill_topics_for_candidate(None, get_candidate_id())
+except Exception:
+    pass
 
 # ============================================================================
 # 跨会话训练图谱

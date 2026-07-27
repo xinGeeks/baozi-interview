@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from storage import (
+    backfill_topics_for_candidate,
     extract_and_store_for_session,
     get_candidate_id,
     get_session,
@@ -376,21 +377,45 @@ def test_get_topic_trend_filters_by_candidate_via_join(db: Path):
 # ============================================================================
 
 
-def test_extract_and_store_for_session_end_to_end(db: Path):
-    sid = _save_simple_session(db, num_user_turns=4)
-    n = extract_and_store_for_session(db, sid, "default")
-    assert n >= 1  # 至少 1 个 topic 写入 cache
+def test_backfill_topics_for_candidate_is_idempotent_and_skips_practice(
+    db: Path,
+):
+    sid_interview = _save_simple_session(db)
+    sid_practice = save_session(
+        db_path=db,
+        level="P5",
+        style="温和",
+        jd="后端",
+        resume_text="",
+        chat_history=[
+            {"role": "user", "content": "redis 缓存 kafka 消息队列 redis"},
+        ],
+        turn_feedback=[],
+        report_text="报告",
+        started_at=datetime.now(timezone.utc),
+        mode="practice",
+    )
 
-    # topic_facts 有该 sid 的行
+    assert backfill_topics_for_candidate(db, "default") == 1
+    assert get_topics_for_candidate(db, "default")
+
     with sqlite3.connect(str(db)) as conn:
-        facts_count = conn.execute(
-            "SELECT COUNT(*) FROM topic_facts WHERE sid=?", (sid,)
+        first_facts = conn.execute(
+            "SELECT COUNT(*) FROM topic_facts"
         ).fetchone()[0]
-    assert facts_count >= 1
+        practice_facts = conn.execute(
+            "SELECT COUNT(*) FROM topic_facts WHERE sid=?", (sid_practice,)
+        ).fetchone()[0]
+        interview_facts = conn.execute(
+            "SELECT COUNT(*) FROM topic_facts WHERE sid=?", (sid_interview,)
+        ).fetchone()[0]
 
-    # cache 有 candidate 的行
-    topics = get_topics_for_candidate(db, "default")
-    assert len(topics) >= 1
+    assert first_facts == interview_facts
+    assert practice_facts == 0
+    assert backfill_topics_for_candidate(db, "default") == 0
+
+    with sqlite3.connect(str(db)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM topic_facts").fetchone()[0] == first_facts
 
 
 def test_extract_and_store_for_session_unknown_sid_returns_zero(db: Path):

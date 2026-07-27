@@ -98,6 +98,45 @@ def test_topic_candidate_enters_practice_interview(tmp_path: Path):
     assert len(at.chat_input) == 1
 
 
+def test_old_sessions_are_backfilled_when_topics_page_opens(tmp_path: Path):
+    db = tmp_path / "backfill.db"
+    init_db(db)
+    save_session(
+        db_path=db,
+        level="社招(中级)",
+        style="温和引导",
+        jd="后端",
+        resume_text="",
+        chat_history=[
+            {"role": "assistant", "content": "问题"},
+            {
+                "role": "user",
+                "content": "redis 缓存 kafka 消息队列 redis 缓存 kafka 消息队列",
+            },
+            {"role": "assistant", "content": "追问"},
+            {
+                "role": "user",
+                "content": "redis 缓存 kafka 消息队列 redis 缓存 kafka 消息队列",
+            },
+            {"role": "assistant", "content": "追问"},
+            {
+                "role": "user",
+                "content": "redis 缓存 kafka 消息队列 redis 缓存 kafka 消息队列",
+            },
+        ],
+        turn_feedback=[],
+        report_text="报告",
+        started_at=datetime(2026, 7, 19, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 7, 19, 12, tzinfo=timezone.utc),
+    )
+
+    at = _topics_page(db)
+    markdown = "\n".join(str(m.value) for m in at.markdown)
+
+    assert "训练主题云" in markdown
+    assert _button_by_label(at, "📍 redis") is not None
+
+
 def test_topics_history_button_requests_report_history_view(tmp_path: Path):
     db = tmp_path / "topics.db"
     sid = _save_history(db)

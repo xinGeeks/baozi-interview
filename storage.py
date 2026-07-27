@@ -540,6 +540,34 @@ def get_topic_trend(
     return [(r["sid"], r["score"], r["ended_at"]) for r in rows]
 
 
+def backfill_topics_for_candidate(
+    db_path: Path | None, candidate_id: str
+) -> int:
+    """为尚无 topic_facts 的历史普通面试补做 topic 抽取。"""
+    if db_path is None:
+        db_path = _default_db_path()
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT s.id
+            FROM interview_sessions s
+            WHERE s.candidate_id = ?
+              AND s.mode = 'interview'
+              AND NOT EXISTS (
+                  SELECT 1 FROM topic_facts tf WHERE tf.sid = s.id
+              )
+            ORDER BY s.ended_at ASC
+            """,
+            (candidate_id,),
+        ).fetchall()
+
+    processed = 0
+    for row in rows:
+        if extract_and_store_for_session(db_path, row["id"], candidate_id) > 0:
+            processed += 1
+    return processed
+
+
 def extract_and_store_for_session(
     db_path: Path | None, sid: str, candidate_id: str
 ) -> int:
