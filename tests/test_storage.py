@@ -103,11 +103,6 @@ def test_init_db_migrates_legacy_c_prefix_to_default(tmp_path: Path):
                 None, "report", 0,
             ),
         )
-        conn.execute(
-            "INSERT INTO consent_log (candidate_id, tos_version, accepted_at) "
-            "VALUES (?, ?, ?)",
-            ("c_legacyhash123", "v1", "2026-07-01T00:00:00+00:00"),
-        )
         conn.commit()
 
     # 再调 init_db → 应触发迁移
@@ -118,12 +113,21 @@ def test_init_db_migrates_legacy_c_prefix_to_default(tmp_path: Path):
             "SELECT candidate_id FROM interview_sessions WHERE id=?",
             ("legacy_001",),
         ).fetchone()[0]
-        consent_cid = conn.execute(
-            "SELECT candidate_id FROM consent_log WHERE tos_version=?",
-            ("v1",),
-        ).fetchone()[0]
     assert sess_cid == "default"
-    assert consent_cid == "default"
+
+
+def test_init_db_does_not_create_consent_log(tmp_path: Path):
+    """ToS 已移除 → consent_log 表不应被 init_db 创建(老 DB 遗留无害)。"""
+    db = tmp_path / "test.db"
+    init_db(db)
+    import sqlite3
+    with sqlite3.connect(str(db)) as conn:
+        tables = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    assert "consent_log" not in tables
 
 
 # ============================================================================

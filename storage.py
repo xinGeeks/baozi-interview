@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import uuid
@@ -70,13 +71,6 @@ CREATE TABLE IF NOT EXISTS turn_feedback (
 CREATE INDEX IF NOT EXISTS idx_feedback_session
     ON turn_feedback(session_id, turn_idx);
 
-CREATE TABLE IF NOT EXISTS consent_log (
-    candidate_id    TEXT NOT NULL,
-    tos_version     TEXT NOT NULL,
-    accepted_at     TEXT NOT NULL,
-    UNIQUE(candidate_id, tos_version)
-);
-
 CREATE TABLE IF NOT EXISTS topic_facts (
     sid             TEXT NOT NULL,
     topic           TEXT NOT NULL,
@@ -98,6 +92,12 @@ CREATE TABLE IF NOT EXISTS candidate_topic_cache (
 
 CREATE INDEX IF NOT EXISTS idx_candidate_topic_cid
     ON candidate_topic_cache(candidate_id);
+
+CREATE TABLE IF NOT EXISTS interview_autosave (
+    candidate_id    TEXT PRIMARY KEY,
+    state_json      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
 """
 
 
@@ -124,10 +124,6 @@ def init_db(db_path: Path | None = None) -> None:
         # 单用户迁移:旧 c_xxx → default
         conn.execute(
             "UPDATE interview_sessions SET candidate_id='default' "
-            "WHERE candidate_id LIKE 'c_%'"
-        )
-        conn.execute(
-            "UPDATE consent_log SET candidate_id='default' "
             "WHERE candidate_id LIKE 'c_%'"
         )
         # Feature Practice 迁移:加 mode 列(老 DB 才有)
@@ -309,46 +305,57 @@ def get_session(db_path: Path | None, session_id: str) -> dict | None:
 
 
 # ============================================================================
-# ToS 接受记录(v0.3 alpha-kickoff)
+# 进行中面试草稿(interview-autosave):刷新后续答
 # ============================================================================
 
 
-def record_consent(
-    db_path: Path | None,
-    candidate_id: str,
-    tos_version: str,
-    accepted_at: datetime | None = None,
+def save_autosave(
+    db_path: Path | None, candidate_id: str, state: dict
 ) -> None:
-    """记录 ToS 接受。重复接受同一 version → UNIQUE 约束静默忽略。"""
+    """写入/覆盖该 candidate 的进行中面试草稿(单行 UPSERT)。"""
     if db_path is None:
         db_path = _default_db_path()
-    accepted_at = accepted_at or datetime.now(timezone.utc)
+    state_json = json.dumps(state, ensure_ascii=False)
+    now = datetime.now(timezone.utc).isoformat()
     with _connect(db_path) as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO consent_log
-              (candidate_id, tos_version, accepted_at)
+            INSERT INTO interview_autosave (candidate_id, state_json, updated_at)
             VALUES (?, ?, ?)
+            ON CONFLICT(candidate_id) DO UPDATE SET
+                state_json = excluded.state_json,
+                updated_at = excluded.updated_at
             """,
-            (candidate_id, tos_version, accepted_at.isoformat()),
+            (candidate_id, state_json, now),
         )
 
 
-def has_accepted_tos(
-    db_path: Path | None, candidate_id: str, tos_version: str
-) -> bool:
-    """该 candidate 是否已接受过指定 tos_version。"""
+def load_autosave(db_path: Path | None, candidate_id: str) -> dict | None:
+    """读取该 candidate 的草稿。不存在或 JSON 损坏 → None。"""
     if db_path is None:
         db_path = _default_db_path()
     with _connect(db_path) as conn:
         row = conn.execute(
-            """
-            SELECT 1 FROM consent_log
-            WHERE candidate_id = ? AND tos_version = ?
-            """,
-            (candidate_id, tos_version),
+            "SELECT state_json FROM interview_autosave WHERE candidate_id = ?",
+            (candidate_id,),
         ).fetchone()
-    return row is not None
+    if row is None:
+        return None
+    try:
+        return json.loads(row["state_json"])
+    except (ValueError, TypeError):
+        return None
+
+
+def clear_autosave(db_path: Path | None, candidate_id: str) -> None:
+    """删除该 candidate 的草稿(幂等,不存在也不报错)。"""
+    if db_path is None:
+        db_path = _default_db_path()
+    with _connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM interview_autosave WHERE candidate_id = ?",
+            (candidate_id,),
+        )
 
 
 # ============================================================================

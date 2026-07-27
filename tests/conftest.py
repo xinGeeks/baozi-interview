@@ -1,7 +1,7 @@
 """共享 pytest fixtures。
 
 - configure_llm:为 app.py 配置 LLM_API_KEY(避免因 API key 缺失导致所有 LLM 路径报错)
-- pre_accepted_tos:绕过 ToS 闸门(v0.3 alpha-kickoff 后所有 app 测试都需先接受 ToS)
+- isolated_app_env:绑独立 DB + 注入 LLM key,绕过 STORAGE_DB_PATH 共享污染
 - fake_llm_factory:为需要响应序列的测试构造 fake LLM
 
 注意:`app.py` 用 `from llm import chat`,所以 monkeypatch 必须 patch `app.chat`
@@ -19,24 +19,22 @@ def configure_llm(monkeypatch):
 
 
 @pytest.fixture
-def pre_accepted_tos(monkeypatch, tmp_path):
-    """预接受 ToS + 用独立 DB。
+def isolated_app_env(monkeypatch, tmp_path):
+    """绑独立 DB + 注入 LLM key。
 
-    返回一个 helper:传入 AppTest 实例,设置 tos_accepted + tos_check_done
-    + 注入独立 DB 环境变量,调用方在 at.run() 之前使用。
+    返回一个 helper:传入 AppTest 实例,把 DB 环境变量绑到 tmp_path,
+    调用方在 at.run() 之前使用。
 
     用法:
         at = AppTest.from_file("app.py")
-        pre_accepted_tos(at)
-        at.run()  # 此时 ToS modal 不会出现
+        isolated_app_env(at)
+        at.run()
     """
     db_path = tmp_path / "test.db"
     monkeypatch.setenv("STORAGE_DB_PATH", str(db_path))
     monkeypatch.setenv("LLM_API_KEY", "sk-test-fixture-key")
 
     def _inject(at):
-        at.session_state["tos_accepted"] = True
-        at.session_state["tos_check_done"] = True
         return at
 
     return _inject

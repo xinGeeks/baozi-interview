@@ -104,9 +104,9 @@ class TestGlobalErrorHandler:
         log_dir.mkdir()
         log_file = log_dir / "error.log"
 
-        # monkeypatch 路径(app._ERROR_LOG_PATH)
-        import app
-        monkeypatch.setattr(app, "_ERROR_LOG_PATH", log_file)
+        # monkeypatch 路径(interview_helpers._ERROR_LOG_PATH)
+        import interview_helpers
+        monkeypatch.setattr(interview_helpers, "_ERROR_LOG_PATH", log_file)
 
         _install_global_error_handler()
         # 模拟未捕获异常
@@ -124,8 +124,8 @@ class TestGlobalErrorHandler:
     def test_hook_skips_keyboard_interrupt(self, tmp_path: Path, monkeypatch):
         """Ctrl+C 不写 error.log(用户主动终止,非 bug)。"""
         log_file = tmp_path / "error.log"
-        import app
-        monkeypatch.setattr(app, "_ERROR_LOG_PATH", log_file)
+        import interview_helpers
+        monkeypatch.setattr(interview_helpers, "_ERROR_LOG_PATH", log_file)
 
         # stub sys.__excepthook
         called = {"n": 0}

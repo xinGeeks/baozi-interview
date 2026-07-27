@@ -65,10 +65,9 @@ streamlit run app.py
 
 ## 数据与隐私
 
-- 简历原文**不持久化**(`storage.py` 只存 MD5 摘要作 candidate_id)
 - 面试对话存在本地 SQLite(`data/interviews.db`),可单条删除 / 一键清空
 - 30 天自动清理过期 session(`STORAGE_RETENTION_DAYS` 可调)
-- 详见 [`docs/privacy.md`](docs/privacy.md)
+- 简历原文仅在面试进行中作为草稿持久化(autosave),用于刷新后续答
 
 ## 开发
 
@@ -107,5 +106,4 @@ mypy *.py
 ## 相关文档
 
 - [`docs/alpha.md`](docs/alpha.md) — Alpha 邀请计划 + 时间窗 + 成功标准
-- [`docs/privacy.md`](docs/privacy.md) — PII 处理原则 + ToS 全文
 - [`docs/llm-cost.md`](docs/llm-cost.md) — 单场面试成本估算 + 模型选型
