@@ -556,9 +556,12 @@ def _handle_user_answer(answer: str, *, generate_next: bool = True) -> None:
                 answer=answer,
             ),
         }]
-        feedback_raw = _do_chat(
-            feedback_messages, temperature=0.3, purpose="feedback"
-        )
+        # spinner 仅覆盖阻塞的 feedback LLM 调用;spinner 上下文退出后,
+        # stream 下一题会自然接手视觉提示,不会与 chat_message 冲突。
+        with st.spinner("💭 面试官思考中…"):
+            feedback_raw = _do_chat(
+                feedback_messages, temperature=0.3, purpose="feedback"
+            )
         parsed = parse_feedback_response(feedback_raw)
         st.session_state.turn_feedback.append({
             "question": last_question[:60],
