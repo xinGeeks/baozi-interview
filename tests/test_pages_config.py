@@ -257,3 +257,36 @@ class TestDefaults:
         assert at.session_state["interview_style"] == STYLES[0], (
             f"默认风格应为 {STYLES[0]},实际: {at.session_state['interview_style']}"
         )
+
+
+# ============================================================================
+# 专项练习交接 (v0.3.1:入口已挪到 pages/practice.py)
+# ============================================================================
+
+
+class TestPracticeHandoff:
+    def test_config_has_no_practice_entry(self, tmp_path: Path):
+        """配置页不应再自带专项练习启动按钮(入口在独立页)。"""
+        at = _config_page(tmp_path / "test.db")
+        assert _button_by_label(at, "启动专项练习") is None, (
+            "专项练习入口应只在 pages/practice.py"
+        )
+
+    def test_config_points_to_practice_page(self, tmp_path: Path):
+        """配置页应有一句指路到菜单栏专项练习页。"""
+        at = _config_page(tmp_path / "test.db")
+        text = "\n".join(c.value for c in at.caption)
+        assert "专项练习" in text, f"应有指路 caption,实际: {text}"
+
+    def test_normal_start_clears_practice_state(self, tmp_path: Path):
+        """走正常『开始面试』应把 practice_mode 复位,避免残留串味。"""
+        at = _config_page(tmp_path / "test.db")
+        at.session_state["practice_mode"] = True
+        at.session_state["practice_topic"] = "旧主题"
+        at.session_state["mock_responses"] = ["请简单介绍一下你自己"]
+        at.run()
+        at.text_area[0].set_value("后端开发 JD").run()
+        _button_by_label(at, "开始面试").click().run()
+
+        assert at.session_state["practice_mode"] is False
+        assert at.session_state["practice_topic"] == ""

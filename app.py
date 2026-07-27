@@ -6,7 +6,7 @@
 1. 页面配置 + DB 初始化 + 全局异常 hook
 2. session_state 初始化
 3. 全局 sidebar(数据删除)
-4. st.navigation 声明 4 页并 run
+4. st.navigation 声明 4 页(配置 / 专项练习 / 面试 / 报告)并 run
 
 page-specific 渲染代码在 pages/*.py;跨页共享逻辑在 interview_helpers.py。
 先 import interview_helpers 让它进 sys.modules,pages 再 import 即命中缓存。
@@ -48,11 +48,12 @@ init_session_state()
 
 
 # ============================================================================
-# st.navigation 声明 4 页
+# st.navigation 声明 4 页(配置 / 专项练习 / 面试 / 报告)
 # ============================================================================
 
 pg = st.navigation([
     st.Page("pages/config.py", title="配置", icon="⚙️", default=True),
+    st.Page("pages/practice.py", title="专项练习", icon="🎯"),
     st.Page("pages/interview.py", title="面试", icon="💬"),
     st.Page("pages/report.py", title="报告", icon="📑"),
 ])

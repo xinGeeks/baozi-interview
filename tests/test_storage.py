@@ -341,3 +341,87 @@ def test_jd_summary_truncated_to_200_chars(db: Path):
 def test_default_db_path_is_in_data_dir():
     assert DEFAULT_DB_PATH.name == "interviews.db"
     assert DEFAULT_DB_PATH.parent.name == "data"
+
+# ============================================================================
+# mode 列 (v0.3.1 专项练习)
+# ============================================================================
+
+def test_save_session_defaults_mode_to_interview(db: Path):
+    """不传 mode → 落 'interview'(向后兼容)。"""
+    chat, feedback, report = _sample_history()
+    sid = save_session(
+        db_path=db,
+        level="社招(中级)",
+        style="温和引导",
+        jd="JD",
+        resume_text="",
+        chat_history=chat,
+        turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+    )
+    rows = list_sessions(db, get_candidate_id(), limit=5)
+    assert rows[0]["id"] == sid
+    assert rows[0]["mode"] == "interview"
+
+
+def test_save_session_accepts_practice_mode(db: Path):
+    """mode='practice' 应原样落库,并被 list_sessions 带出。"""
+    chat, feedback, report = _sample_history()
+    save_session(
+        db_path=db,
+        level="社招(高级)",
+        style="压力深挖",
+        jd="",
+        resume_text="",
+        chat_history=chat,
+        turn_feedback=feedback,
+        report_text=report,
+        started_at=datetime.now(timezone.utc),
+        mode="practice",
+    )
+    rows = list_sessions(db, get_candidate_id(), limit=5)
+    assert rows[0]["mode"] == "practice"
+
+
+def test_init_db_adds_mode_column_to_legacy_db(tmp_path: Path):
+    """老 DB(无 mode 列)init_db 应幂等 ALTER TABLE 补列,已有行 backfill。"""
+    p = tmp_path / "legacy.db"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(p)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE interview_sessions (
+                id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                level TEXT NOT NULL,
+                style TEXT NOT NULL,
+                jd_summary TEXT NOT NULL,
+                jd_hash TEXT NOT NULL,
+                score_avg REAL,
+                report_text TEXT NOT NULL,
+                turn_count INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO interview_sessions VALUES "
+            "('old1','default','t','t','校招','温和引导','jd','h',6.0,'r',2)"
+        )
+
+    init_db(p)
+
+    with sqlite3.connect(str(p)) as conn:
+        cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info('interview_sessions')"
+        ).fetchall()}
+        assert "mode" in cols
+        mode = conn.execute(
+            "SELECT mode FROM interview_sessions WHERE id='old1'"
+        ).fetchone()[0]
+    assert mode == "interview", f"老行应 backfill 为 interview,实际: {mode}"
+
+    # 幂等:再跑一次不炸
+    init_db(p)

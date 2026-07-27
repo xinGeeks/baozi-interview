@@ -106,3 +106,56 @@ def test_next_session_requests_config_navigation(tmp_path: Path):
     assert at.session_state["current_page"] == "config"
     assert at.session_state["interview_started"] is False
     assert at.session_state["report_text"] == ""
+
+
+# ============================================================================
+# 历史列表 practice 徽标 (v0.3.1)
+# ============================================================================
+
+
+def _save_practice_history(db_path: Path) -> str:
+    init_db(db_path)
+    return save_session(
+        db_path=db_path,
+        level="社招(高级)",
+        style="压力深挖",
+        jd="",
+        resume_text="",
+        chat_history=[
+            {"role": "assistant", "content": "kafka ISR 是什么?"},
+            {"role": "user", "content": "同步副本集合"},
+        ],
+        turn_feedback=[{"question": "kafka ISR", "score": 7, "advice": "补细节"}],
+        report_text="练习报告正文",
+        started_at=datetime(2026, 7, 21, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 7, 21, 12, tzinfo=timezone.utc),
+        mode="practice",
+    )
+
+
+def test_history_list_marks_practice_session(tmp_path: Path):
+    """practice session 在历史列表应带『🎯 练习 ·』徽标。"""
+    db = tmp_path / "report.db"
+    _save_practice_history(db)
+    at = _report_page(db)
+    at.session_state["report_view"] = "历史报告"
+    at.run()
+
+    labels = [str(b.label or "") for b in at.button]
+    assert any("🎯 练习 ·" in lb for lb in labels), (
+        f"practice 场次应带练习徽标,实际: {labels}"
+    )
+
+
+def test_history_list_does_not_mark_normal_session(tmp_path: Path):
+    """正常面试场次不应带练习徽标。"""
+    db = tmp_path / "report.db"
+    _save_history(db)
+    at = _report_page(db)
+    at.session_state["report_view"] = "历史报告"
+    at.run()
+
+    labels = [str(b.label or "") for b in at.button]
+    assert not any("🎯 练习 ·" in lb for lb in labels), (
+        f"正常面试不应带练习徽标,实际: {labels}"
+    )

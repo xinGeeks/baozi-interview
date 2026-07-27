@@ -44,10 +44,19 @@ if (
     # 重跑一次:丢弃 auto-start 内联流式渲染,统一由下方 history 循环渲染
     st.rerun()
 
-st.title("💬 面试对话")
-st.caption(
-    f"{st.session_state.interview_level} · {st.session_state.interview_style}"
-)
+_is_practice = bool(st.session_state.get("practice_mode"))
+if _is_practice:
+    st.title("🎯 专项练习")
+    st.caption(
+        f"焦点主题:{st.session_state.practice_topic} · "
+        f"{st.session_state.interview_level} · "
+        f"{st.session_state.interview_style}"
+    )
+else:
+    st.title("💬 面试对话")
+    st.caption(
+        f"{st.session_state.interview_level} · {st.session_state.interview_style}"
+    )
 
 # ---- 错误 / 成功提示 ----
 if st.session_state.error_msg:
@@ -63,7 +72,10 @@ if st.session_state.success_msg:
 if not st.session_state.interview_started:
     if _render_resume_prompt(target="interview"):
         st.stop()
-    st.info("👈 还没开始面试。请到『配置』页填好简历 / JD 后点『开始面试』。")
+    st.info(
+        "👈 还没开始。请到『配置』页填好简历 / JD 后点『开始面试』,"
+        "或输入主题启动『专项练习』。"
+    )
     if st.button("← 去配置页", key="goto_config_from_interview"):
         request_nav("config")
     st.stop()
@@ -91,7 +103,10 @@ for msg in st.session_state.chat_history:
 # ---- 控制:结束面试 ----
 st.divider()
 if not st.session_state.interview_ended:
-    if st.button("🛑 结束面试并出报告", key="end_interview", type="secondary"):
+    _end_label = (
+        "🚪 退出专项练习并出报告" if _is_practice else "🛑 结束面试并出报告"
+    )
+    if st.button(_end_label, key="end_interview", type="secondary"):
         _generate_report()
         st.session_state.pending_report_nav = True
         st.rerun()
@@ -104,10 +119,12 @@ if st.session_state.interview_started and not st.session_state.interview_ended:
             "⛔ 今日 token 预算已用完,无法继续面试。"
             "可结束面试并生成报告,或等到 UTC 0 点重置。"
         )
-    user_input = st.chat_input(
-        "输入你的回答 (含『结束面试』可提前结束)",
-        disabled=_budget_blocked,
+    _placeholder = (
+        "输入你的回答 (含『结束面试』可提前退出练习)"
+        if _is_practice
+        else "输入你的回答 (含『结束面试』可提前结束)"
     )
+    user_input = st.chat_input(_placeholder, disabled=_budget_blocked)
     if user_input and not _budget_blocked:
         should_end = END_SIGNAL in user_input
         _handle_user_answer(user_input, generate_next=not should_end)

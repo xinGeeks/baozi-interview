@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS interview_sessions (
     jd_hash         TEXT NOT NULL,
     score_avg       REAL,
     report_text     TEXT NOT NULL,
-    turn_count      INTEGER NOT NULL
+    turn_count      INTEGER NOT NULL,
+    mode            TEXT NOT NULL DEFAULT 'interview'
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_candidate
@@ -93,6 +94,8 @@ def init_db(db_path: Path | None = None) -> None:
 
     v0.3: 单用户模式下,把历史上 c_* 格式的 candidate_id 收敛到 "default",
     让 alpha 测试期落的数据仍可见(一次性,UPDATE 影响行数 = 0 后幂等)。
+    v0.3.1: 给 interview_sessions 加 mode 列(幂等 ALTER TABLE),
+    已有行 backfill 为 'interview',用于区分『专项练习』与『正常面试』。
     """
     with _connect(db_path) as conn:
         conn.executescript(SCHEMA)
@@ -101,6 +104,18 @@ def init_db(db_path: Path | None = None) -> None:
             "UPDATE interview_sessions SET candidate_id='default' "
             "WHERE candidate_id LIKE 'c_%'"
         )
+        # mode 列迁移(老 DB 没有时再补)
+        cols = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info('interview_sessions')"
+            ).fetchall()
+        }
+        if "mode" not in cols:
+            conn.execute(
+                "ALTER TABLE interview_sessions ADD COLUMN mode "
+                "TEXT NOT NULL DEFAULT 'interview'"
+            )
 
 
 def get_candidate_id() -> str:
@@ -123,8 +138,14 @@ def save_session(
     report_text: str,
     started_at: datetime,
     ended_at: datetime | None = None,
+    mode: str = "interview",
 ) -> str:
-    """落盘一场完整面试,返回 session_id。单事务 3 表。"""
+    """落盘一场完整面试,返回 session_id。单事务 3 表。
+
+    Args:
+        mode: 'interview'(正常面试)或 'practice'(专项练习)。
+            practice 模式仅作为历史区分显示,不影响抽取逻辑(抽题模块不在该项目内)。
+    """
     if db_path is None:
         db_path = _default_db_path()
     ended_at = ended_at or datetime.now(timezone.utc)
@@ -147,13 +168,13 @@ def save_session(
             """
             INSERT INTO interview_sessions
               (id, candidate_id, started_at, ended_at, level, style,
-               jd_summary, jd_hash, score_avg, report_text, turn_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               jd_summary, jd_hash, score_avg, report_text, turn_count, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 sid, cid, started_at.isoformat(), ended_at.isoformat(),
                 level, style, jd_summary, jd_hash, score_avg, report_text,
-                len(user_turns),
+                len(user_turns), mode,
             ),
         )
         conn.executemany(
@@ -196,7 +217,7 @@ def list_sessions(
         rows = conn.execute(
             """
             SELECT id, started_at, ended_at, level, style,
-                   jd_summary, score_avg, turn_count
+                   jd_summary, score_avg, turn_count, mode
             FROM interview_sessions
             WHERE candidate_id = ?
             ORDER BY ended_at DESC

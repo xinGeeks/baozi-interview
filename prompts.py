@@ -95,8 +95,15 @@ def build_interviewer_system_prompt(
     style: str,
     resume: str,
     jd: str,
+    *,
+    focus_context: str | None = None,
 ) -> str:
-    """构造面试官系统 prompt,主对话循环每轮都带。"""
+    """构造面试官系统 prompt,主对话循环每轮都带。
+
+    Args:
+        focus_context: 非 None 时,进入『专项练习模式』——首题必须围绕该主题提问,
+            不允许先要求自我介绍。None 时为普通面试,按常规流程。
+    """
     if level not in LEVELS:
         raise ValueError(f"未知职级:{level!r},必须是 {LEVELS} 之一")
     if style not in STYLES:
@@ -107,6 +114,45 @@ def build_interviewer_system_prompt(
         else "用户未上传简历,仅根据 JD 通用提问。"
     )
     jd_section = jd.strip() if jd and jd.strip() else "(用户未填写 JD)"
+
+    focus_block = ""
+    if focus_context:
+        focus_block = f"""
+
+## [专项练习模式] 当前焦点主题:「{focus_context}」
+
+【铁律】首题必须直接围绕「{focus_context}」提问(基础概念 / 典型场景 / 踩坑 / 简历交叉),
+不允许先要求自我介绍或任何与主题无关的开场。
+请围绕该主题深挖:基础概念 → 典型场景 → 踩过的坑 → 与简历的交叉验证。
+若候选人主动偏题可顺势切换,但每 ≥3 轮显式关联一次本主题,确保训练密度。
+"""
+
+    if focus_context:
+        flow_block = (
+            "## 流程标准化(专项练习模式:不是死板题库,是节奏参考)\n"
+            "围绕焦点主题的『深挖循环』:基础概念 → 典型场景 → 踩过的坑 → "
+            "与简历的交叉验证 → 难度递进的小综合题。\n"
+            "【铁律】首题必须直接围绕焦点主题提问,不允许先要求自我介绍;"
+            "后续每 ≥3 轮显式回到焦点主题,确保训练密度。"
+        )
+        opening_block = (
+            f"## 开场白(专项练习模式)\n"
+            f"【铁律】不允许以『请简单介绍一下你自己』作为开场,也不允许泛泛"
+            f"『请介绍一下』或『聊聊你自己』。\n"
+            f"正确开场:用一句话切入焦点主题(例如『我们直接进入 {focus_context} "
+            f"练习,先请你讲讲 {focus_context} 的核心概念…』),随即抛出第一道"
+            f"围绕该主题的问题。"
+        )
+    else:
+        flow_block = (
+            "## 流程标准化(不是死板题库,是节奏参考)\n"
+            "开场自我介绍 → 个人经历/项目深挖 → 岗位 JD 对应专业能力考核 → "
+            "综合软实力考察 → 开放提问"
+        )
+        opening_block = (
+            "## 开场白\n"
+            "第一次对话时,以『请简单介绍一下你自己』作为开场。"
+        )
 
     return f"""你是一名经验丰富的【面试教练】,正在进行一对一真实模拟面试,帮助求职者练习和提升。
 
@@ -126,14 +172,13 @@ def build_interviewer_system_prompt(
 
 {STYLE_FOCUS[style]}
 
-## 流程标准化(不是死板题库,是节奏参考)
+## 流程标准化
 
-开场自我介绍 → 个人经历/项目深挖 → 岗位 JD 对应专业能力考核 →
-综合软实力考察 → 开放提问
-
+{flow_block}
+{focus_block}
 ## 开场白
 
-第一次对话时,以『请简单介绍一下你自己』作为开场。
+{opening_block}
 
 ## 核心规则
 1. {SINGLE_QUESTION_RULE}

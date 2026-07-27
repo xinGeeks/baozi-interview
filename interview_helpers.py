@@ -72,6 +72,7 @@ _ERROR_LOG_PATH = Path(__file__).parent / "data" / "error.log"
 
 PAGE_PATHS = {
     "config": "pages/config.py",
+    "practice": "pages/practice.py",
     "interview": "pages/interview.py",
     "report": "pages/report.py",
 }
@@ -142,6 +143,9 @@ DEFAULTS = {
     "authenticity_report": None,    # AuthenticityReport 或 None(报告末尾 LLM 聚合结果)
     # v0.3 alpha-kickoff: 成本
     "token_counter": None,          # DailyTokenCounter(懒初始化,见 _token_counter)
+    # v0.3.1 专项练习:焦点主题模式
+    "practice_mode": False,         # True 时启用专项练习 prompt 注入
+    "practice_topic": "",           # 当前专项练习焦点主题
     # v0.3 multipage-navigation
     "current_page": "config",       # "config" | "interview" | "report"
     "pending_goto": "",             # 延迟跳转目标;由 _consume_nav 在页顶消费
@@ -171,6 +175,8 @@ AUTOSAVE_KEYS = [
     "interview_style",
     "jd_content",
     "resume_content",
+    "practice_mode",
+    "practice_topic",
     "interview_started_at",
 ]
 
@@ -432,20 +438,27 @@ def _user_friendly_error(e: LLMError) -> str:
 
 
 def _system_prompt() -> str:
+    focus = (
+        st.session_state.practice_topic
+        if st.session_state.get("practice_mode") else None
+    )
     return build_interviewer_system_prompt(
         level=st.session_state.interview_level,
         style=st.session_state.interview_style,
         resume=st.session_state.resume_content,
         jd=st.session_state.jd_content,
+        focus_context=focus,
     )
 
 
 def _start_interview() -> None:
     """开始面试:清空历史 + 流式生成第一题。
 
+    practice_mode=True 时跳过 JD 非空校验(focus_context 替代 JD 提供训练方向)。
     在 pages/interview.py 的 auto-start trigger 里调用,流式渲染落在面试页。
     """
-    if not st.session_state.jd_content.strip():
+    is_practice = st.session_state.get("practice_mode", False)
+    if not is_practice and not st.session_state.jd_content.strip():
         st.session_state.error_msg = "请先粘贴 JD 再开始面试"
         return
     st.session_state.chat_history = []
@@ -462,7 +475,7 @@ def _start_interview() -> None:
 
     messages = [
         {"role": "system", "content": _system_prompt()},
-        {"role": "user", "content": "请开始面试"},
+        {"role": "user", "content": "请开始专项练习" if is_practice else "请开始面试"},
     ]
     pieces: list[str] = []
     try:
@@ -708,6 +721,7 @@ def _generate_report() -> None:
                 st.session_state.interview_started_at
                 or datetime.now(timezone.utc)
             ),
+            mode="practice" if st.session_state.get("practice_mode") else "interview",
         )
         st.session_state.current_session_id = sid
         st.session_state.success_msg = f"💾 已保存到历史 (id: {sid})"

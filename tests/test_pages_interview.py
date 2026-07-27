@@ -458,3 +458,105 @@ class TestReportGeneration:
         tf = captured.get("turn_feedback")
         assert tf is not None
         assert len(tf) == 2
+
+
+# ============================================================================
+# 专项练习模式 (v0.3.1)
+# ============================================================================
+
+
+class TestPracticeMode:
+    def _practice(self, db_path: Path, **kw):
+        at = _interview(db_path, **kw)
+        at.session_state["practice_mode"] = True
+        at.session_state["practice_topic"] = "kafka 高可用"
+        at.run()
+        return at
+
+    def test_practice_title_and_topic_caption(self, tmp_path: Path):
+        """practice 模式标题应是『专项练习』,caption 带焦点主题。"""
+        at = self._practice(tmp_path / "test.db")
+        titles = [t.value for t in at.title]
+        assert any("专项练习" in t for t in titles), (
+            f"期望『专项练习』标题,实际: {titles}"
+        )
+        text = "\n".join(c.value for c in at.caption)
+        assert "kafka 高可用" in text, f"caption 应含焦点主题,实际: {text}"
+
+    def test_practice_end_button_label(self, tmp_path: Path):
+        """practice 模式结束按钮文案应是退出专项练习。"""
+        at = self._practice(tmp_path / "test.db")
+        assert _button_by_label(at, "退出专项练习") is not None
+
+    def test_practice_auto_start_targets_topic(self, tmp_path: Path):
+        """practice auto-start:system prompt 带 focus,首题不是自我介绍。"""
+        at = _interview(
+            tmp_path / "test.db",
+            interview_started=False,
+            mock_responses=["kafka 的 ISR 机制是怎么保证高可用的?"],
+        )
+        at.session_state["practice_mode"] = True
+        at.session_state["practice_topic"] = "kafka 高可用"
+        at.session_state["pending_start"] = True
+        at.run()
+
+        assert at.session_state["interview_started"] is True
+        history = at.session_state["chat_history"]
+        assert history, "auto-start 应产生首题"
+        assert history[0]["role"] == "assistant"
+        assert "请简单介绍一下你自己" not in history[0]["content"]
+
+    def test_practice_start_without_jd_allowed(self, tmp_path: Path):
+        """practice 不要求 JD:空 JD 也能起来,不落 error_msg。"""
+        at = _interview(
+            tmp_path / "test.db",
+            interview_started=False,
+            jd_content="",
+            mock_responses=["先说说 kafka 分区副本的作用?"],
+        )
+        at.session_state["practice_mode"] = True
+        at.session_state["practice_topic"] = "kafka 高可用"
+        at.session_state["pending_start"] = True
+        at.run()
+
+        assert at.session_state["interview_started"] is True
+        assert not at.session_state["error_msg"]
+
+    def test_normal_start_without_jd_blocked(self, tmp_path: Path):
+        """向后兼容护栏:正常面试空 JD 仍应被拦。"""
+        at = _interview(
+            tmp_path / "test.db",
+            interview_started=False,
+            jd_content="",
+            mock_responses=["请简单介绍一下你自己"],
+        )
+        at.session_state["pending_start"] = True
+        at.run()
+
+        assert at.session_state["interview_started"] is False
+        assert "JD" in at.session_state["error_msg"]
+
+    def test_practice_session_saved_with_mode_practice(self, tmp_path: Path):
+        """practice 结束落库 mode='practice'。"""
+        db = tmp_path / "test.db"
+        at = _interview(
+            db,
+            chat_history=[
+                {"role": "assistant", "content": "kafka ISR 是什么?"},
+                {"role": "user", "content": "同步副本集合"},
+            ],
+            turn_feedback=[{"question": "kafka ISR", "score": 7, "advice": "补细节"}],
+            mock_responses=["## 报告\n还不错"],
+        )
+        at.session_state["practice_mode"] = True
+        at.session_state["practice_topic"] = "kafka 高可用"
+        at.run()
+        _button_by_label(at, "退出专项练习").click().run()
+
+        with sqlite3.connect(str(db)) as conn:
+            modes = [
+                r[0] for r in conn.execute(
+                    "SELECT mode FROM interview_sessions"
+                ).fetchall()
+            ]
+        assert modes == ["practice"], f"应落一条 practice session,实际: {modes}"

@@ -2,7 +2,7 @@
 
 覆盖 v0.3 multipage-navigation 拆页后 entry 的剩余职责:
 - 全局 sidebar:清空全部历史 expander
-- st.navigation 声明 3 页(default=config)
+- st.navigation 声明 4 页(default=config)
 
 ToS 系统已移除(2026-07),此处不再覆盖 ToS 闸门相关行为。
 """
@@ -79,12 +79,19 @@ class TestNavigation:
             "DEFAULTS 应默认 current_page='config'"
         )
 
-    def test_page_paths_dict_has_three_pages(self):
-        """PAGE_PATHS 应声明 3 页。"""
+    def test_page_paths_dict_has_four_pages(self):
+        """PAGE_PATHS 应声明 4 页(v0.3.1 加入专项练习)。"""
         from interview_helpers import PAGE_PATHS
         assert set(PAGE_PATHS.keys()) == {
-            "config", "interview", "report",
-        }, f"PAGE_PATHS keys 应恰好 3 项,实际: {list(PAGE_PATHS.keys())}"
+            "config", "practice", "interview", "report",
+        }, f"PAGE_PATHS keys 应恰好 4 项,实际: {list(PAGE_PATHS.keys())}"
+
+    def test_all_page_paths_exist_on_disk(self):
+        """PAGE_PATHS 里每个路径都应真实存在(防 navigation 声明与文件脱节)。"""
+        from pathlib import Path as _P
+        from interview_helpers import PAGE_PATHS
+        missing = [p for p in PAGE_PATHS.values() if not _P(p).exists()]
+        assert not missing, f"PAGE_PATHS 指向不存在的文件: {missing}"
 
     def test_no_page_specific_render_in_entry(self, tmp_path: Path):
         """entry 不应残留 page-specific 渲染(标题不应是『面试对话』等)。"""

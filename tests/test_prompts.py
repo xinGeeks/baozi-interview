@@ -230,3 +230,75 @@ def test_report_prompt_without_feedback_omits_section():
     assert "逐轮评分" not in prompt_with_empty
 
 
+
+
+# ============================================================================
+# 专项练习:focus_context 分支 (v0.3.1)
+# ============================================================================
+
+
+class TestFocusContext:
+    def test_practice_mode_forbids_self_intro_opening(self):
+        """focus_context 非空时,开场白段不得走『第一次对话时』自我介绍分支。"""
+        prompt = build_interviewer_system_prompt(
+            level="社招(中级)",
+            style="温和引导",
+            resume="r",
+            jd="j",
+            focus_context="kafka 高可用",
+        )
+        assert "第一次对话时," not in prompt, (
+            "专项练习模式不应保留 legacy 自我介绍开场白段"
+        )
+        assert "专项练习模式" in prompt
+        assert "不允许" in prompt
+
+    def test_practice_mode_mentions_topic_multiple_times(self):
+        """焦点主题应在 prompt 中多次出现(流程段 + 开场白段 + focus 段)。"""
+        topic = "Redis 缓存击穿"
+        prompt = build_interviewer_system_prompt(
+            level="社招(高级)",
+            style="压力深挖",
+            resume="r",
+            jd="j",
+            focus_context=topic,
+        )
+        assert prompt.count(topic) >= 3, (
+            f"焦点主题应至少出现 3 次,实际 {prompt.count(topic)} 次"
+        )
+
+    def test_practice_mode_rewrites_flow_block(self):
+        """practice 模式的流程标准化段应是深挖循环,不是『开场自我介绍 → ...』。"""
+        prompt = build_interviewer_system_prompt(
+            level="校招",
+            style="温和引导",
+            resume="",
+            jd="",
+            focus_context="系统设计",
+        )
+        assert "开场自我介绍 →" not in prompt
+        assert "深挖循环" in prompt
+
+    def test_legacy_mode_keeps_self_intro_opening(self):
+        """focus_context=None(默认)时,legacy 自我介绍开场白必须一字不动。"""
+        prompt = build_interviewer_system_prompt(
+            level="社招(中级)",
+            style="温和引导",
+            resume="r",
+            jd="j",
+        )
+        assert "第一次对话时,以『请简单介绍一下你自己』作为开场。" in prompt
+        assert "专项练习模式" not in prompt
+        assert "开场自我介绍 →" in prompt
+
+    def test_practice_mode_keeps_core_rules(self):
+        """practice 模式不应丢掉单题铁律 / 不打分铁律 / END_SIGNAL。"""
+        prompt = build_interviewer_system_prompt(
+            level="社招(资深)",
+            style="压力深挖",
+            resume="r",
+            jd="j",
+            focus_context="架构演进",
+        )
+        assert SINGLE_QUESTION_RULE in prompt
+        assert END_SIGNAL in prompt

@@ -71,6 +71,8 @@ if seg == "本场报告":
             st.session_state.current_session_id = ""
             st.session_state.loaded_session_id = ""
             st.session_state.viewing_history = False
+            st.session_state.practice_mode = False
+            st.session_state.practice_topic = ""
             request_nav("config")
     else:
         st.info("还没有本场报告。先到『配置』页开始一场面试。")
@@ -103,8 +105,11 @@ else:
                     if h.get("score_avg") is not None
                     else ""
                 )
+                mode_badge = (
+                    "🎯 练习 · " if h.get("mode") == "practice" else ""
+                )
                 label = (
-                    f"{h['ended_at'][:10]} · {h['level']} · "
+                    f"{mode_badge}{h['ended_at'][:10]} · {h['level']} · "
                     f"{h['turn_count']} 轮{score_str}"
                 )
                 col_view, col_del = st.columns([6, 1])

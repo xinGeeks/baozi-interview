@@ -2,6 +2,8 @@
 
 流程第 1 页。填好配置点『🚀 开始面试』→ 校验 JD → 置 pending_start →
 跳到面试页(auto-start trigger 生成第一题)。
+
+只练单个主题走 pages/practice.py(菜单栏『🎯 专项练习』),不需要 JD。
 """
 from __future__ import annotations
 
@@ -125,5 +127,9 @@ if st.button("🚀 开始面试", type="primary", use_container_width=True):
         st.session_state.error_msg = ""
         st.session_state.viewing_history = False
         st.session_state.loaded_session_id = ""
+        st.session_state.practice_mode = False
+        st.session_state.practice_topic = ""
         st.session_state.pending_start = True
         request_nav("interview")
+
+st.caption("只想围绕单个主题深挖?去菜单栏『🎯 专项练习』页,不需要 JD。")
