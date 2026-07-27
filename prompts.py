@@ -109,11 +109,36 @@ def build_interviewer_system_prompt(
     if style not in STYLES:
         raise ValueError(f"未知风格:{style!r},必须是 {STYLES} 之一")
 
-    resume_section = (
-        resume.strip() if resume and resume.strip()
-        else "用户未上传简历,仅根据 JD 通用提问。"
+    has_resume = bool(resume and resume.strip())
+    has_jd = bool(jd and jd.strip())
+
+    if focus_context:
+        # 专项练习:简历 / JD 都不是必需项,训练方向完全由焦点主题决定。
+        # 没有的部分直接不进 prompt,避免 LLM 反过来索要。
+        parts = ["【本场类型】:专项练习(无目标岗位、不需要 JD 与简历)"]
+        if has_resume:
+            parts.append(f"【候选人简历(仅供交叉验证,非考核范围)】:\n{resume.strip()}")
+        context_block = "\n\n".join(parts)
+    else:
+        resume_section = (
+            resume.strip() if has_resume
+            else "用户未上传简历,仅根据 JD 通用提问。"
+        )
+        jd_section = jd.strip() if has_jd else "(用户未填写 JD)"
+        context_block = (
+            f"【候选人简历】:\n{resume_section}\n\n"
+            f"【目标岗位 JD】:\n{jd_section}"
+        )
+
+    # 无简历时深挖链条去掉『简历交叉』这一环(不补重复的综合题)
+    _cross_tail = " → 与简历的交叉验证" if has_resume else ""
+    _deep_chain = f"基础概念 → 典型场景 → 踩过的坑{_cross_tail}"
+    _flow_chain = f"{_deep_chain} → 难度递进的小综合题"
+    _first_q_hint = (
+        "基础概念 / 典型场景 / 踩坑 / 简历交叉"
+        if has_resume
+        else "基础概念 / 典型场景 / 踩坑"
     )
-    jd_section = jd.strip() if jd and jd.strip() else "(用户未填写 JD)"
 
     focus_block = ""
     if focus_context:
@@ -121,22 +146,39 @@ def build_interviewer_system_prompt(
 
 ## [专项练习模式] 当前焦点主题:「{focus_context}」
 
-【铁律】首题必须直接围绕「{focus_context}」提问(基础概念 / 典型场景 / 踩坑 / 简历交叉),
+【铁律】首题必须直接围绕「{focus_context}」提问({_first_q_hint}),
 不允许先要求自我介绍或任何与主题无关的开场。
-请围绕该主题深挖:基础概念 → 典型场景 → 踩过的坑 → 与简历的交叉验证。
+请围绕该主题深挖:{_deep_chain}。
 若候选人主动偏题可顺势切换,但每 ≥3 轮显式关联一次本主题,确保训练密度。
 """
 
     if focus_context:
+        resume_rule = (
+            "候选人简历若有内容,可用来做交叉验证(例:把焦点主题和他做过的项目对上);"
+            "简历为空时完全不提简历,直接就焦点主题本身提问,不要索要简历或工作经历清单。"
+            if has_resume
+            else "本场无简历。禁止索要简历、工作年限或岗位背景,直接围绕焦点主题提问。"
+        )
+        jd_rule = (
+            "本场无目标岗位约束。禁止询问或假设候选人应聘什么岗位,"
+            "考核范围完全由焦点主题决定。"
+        )
+    else:
+        resume_rule = (
+            "优先针对候选人简历中提到的项目、技术栈、工作经历追问,"
+            "避免脱离候选人实际经历。"
+        )
+        jd_rule = "严格对齐 JD 要求的技能、岗位职责,考核岗位必备技能。"
+
+    if focus_context:
         flow_block = (
-            "## 流程标准化(专项练习模式:不是死板题库,是节奏参考)\n"
-            "围绕焦点主题的『深挖循环』:基础概念 → 典型场景 → 踩过的坑 → "
-            "与简历的交叉验证 → 难度递进的小综合题。\n"
+            "(专项练习模式:不是死板题库,是节奏参考)\n"
+            f"围绕焦点主题的『深挖循环』:{_flow_chain}。\n"
             "【铁律】首题必须直接围绕焦点主题提问,不允许先要求自我介绍;"
             "后续每 ≥3 轮显式回到焦点主题,确保训练密度。"
         )
         opening_block = (
-            f"## 开场白(专项练习模式)\n"
+            f"(专项练习模式)\n"
             f"【铁律】不允许以『请简单介绍一下你自己』作为开场,也不允许泛泛"
             f"『请介绍一下』或『聊聊你自己』。\n"
             f"正确开场:用一句话切入焦点主题(例如『我们直接进入 {focus_context} "
@@ -145,24 +187,17 @@ def build_interviewer_system_prompt(
         )
     else:
         flow_block = (
-            "## 流程标准化(不是死板题库,是节奏参考)\n"
+            "(不是死板题库,是节奏参考)\n"
             "开场自我介绍 → 个人经历/项目深挖 → 岗位 JD 对应专业能力考核 → "
             "综合软实力考察 → 开放提问"
         )
-        opening_block = (
-            "## 开场白\n"
-            "第一次对话时,以『请简单介绍一下你自己』作为开场。"
-        )
+        opening_block = "第一次对话时,以『请简单介绍一下你自己』作为开场。"
 
     return f"""你是一名经验丰富的【面试教练】,正在进行一对一真实模拟面试,帮助求职者练习和提升。
 
 【面试等级】:{level}
 【面试风格】:{style}
-【候选人简历】:
-{resume_section}
-
-【目标岗位 JD】:
-{jd_section}
+{context_block}
 
 ## 你的提问方向(必须严格围绕)
 
@@ -183,8 +218,8 @@ def build_interviewer_system_prompt(
 ## 核心规则
 1. {SINGLE_QUESTION_RULE}
 2. {NO_EARLY_VERDICT_RULE}
-3. 优先针对候选人简历中提到的项目、技术栈、工作经历追问,避免脱离候选人实际经历。
-4. 严格对齐 JD 要求的技能、岗位职责,考核岗位必备技能。
+3. {resume_rule}
+4. {jd_rule}
 5. 严格匹配 {level} 难度,不越级提问(校招不考架构、资深不只聊基础)。
 6. 针对候选人回答的模糊点、漏洞、不实描述、知识盲区进行针对性追问。
 7. 全程口语化、真实化,不生硬、不机械化、不使用『这是一个好问题』这类客套。
@@ -200,6 +235,8 @@ def build_report_prompt(
     jd: str,
     chat_history: list[dict],
     turn_feedback: list[dict] | None = None,
+    *,
+    focus_context: str | None = None,
 ) -> str:
     """构造报告生成的 user prompt(报告本身用单次 user 调用生成,无 system)。
 
@@ -211,6 +248,8 @@ def build_report_prompt(
         turn_feedback: 每轮即时反馈(可选),元素格式
             {"question": str, "score": int, "advice": str}。
             None 或空列表时该段在 prompt 中省略(向后兼容)。
+        focus_context: 非 None 时为『专项练习复盘』——没有目标岗位/JD,
+            把『岗位匹配度』换成『主题掌握度』,基础信息段不提岗位。
     """
     if level not in LEVELS:
         raise ValueError(f"未知职级:{level!r}")
@@ -246,14 +285,45 @@ def build_report_prompt(
   略高/略低,只要在硬约束 #3 范围内。
 """
 
+    if focus_context:
+        parts = [
+            "【本场类型】:专项练习复盘(无目标岗位、不需要 JD 与简历)",
+            f"【焦点主题】:{focus_context}",
+        ]
+        if resume and resume.strip():
+            parts.append(
+                f"【候选人简历(仅供交叉验证,非考核范围)】:\n{resume.strip()}"
+            )
+        header_block = "\n\n".join(parts)
+        dim1 = f"主题掌握度(对「{focus_context}」的理解深度与完整度)"
+        basic_info_line = f"- 练习主题:{focus_context}"
+        strength_line = (
+            f"列出 2-4 条,每条都贴合「{focus_context}」这一主题和 {level} 职级,"
+            "引用具体回答。"
+        )
+        weakness_line = (
+            f"列出 2-4 条,精准指出「{focus_context}」上的知识盲区和回答薄弱点,"
+            "避免空话。"
+        )
+        no_jd_rule = (
+            "\n7. **不评岗位匹配**:本场没有目标岗位,禁止写『岗位匹配』"
+            "『是否符合 JD』这类结论,也不要虚构一个岗位。"
+        )
+    else:
+        header_block = (
+            f"【候选人简历】:\n{resume.strip() or '(未上传简历)'}\n\n"
+            f"【目标岗位 JD】:\n{jd.strip() or '(用户未填写 JD)'}"
+        )
+        dim1 = "岗位匹配度"
+        basic_info_line = "- 目标岗位(从 JD 提炼)"
+        strength_line = "列出 2-4 条,每条都贴合岗位和职级,引用具体回答。"
+        weakness_line = "列出 2-4 条,精准指出简历或回答中的薄弱点,避免空话。"
+        no_jd_rule = ""
+
     return f"""你是一位经验丰富的【面试教练】,根据以下完整的模拟面试记录,给求职者写一份**复盘报告**。
 
 【面试等级】:{level}
-【候选人简历】:
-{resume.strip() or "(未上传简历)"}
-
-【目标岗位 JD】:
-{jd.strip() or "(用户未填写 JD)"}
+{header_block}
 
 【完整面试对话记录】:
 {transcript}
@@ -267,17 +337,17 @@ def build_report_prompt(
 3. **不全是 7-8 分**:优秀维度打 8-9,薄弱维度打 4-6,缺失维度打 2-3,根据实际表现拉开差距。
 4. **优势要具体**:不能说『基础扎实』,要像『在校项目 X 中独立完成了 Y 模块,体现 Z 能力』。
 5. **短板要可改**:每个短板要指出『下次可以怎么答』,不能只贴标签。
-6. **拒绝套话**:禁止使用『综合表现良好』『有待加强』『具有一定潜力』这种万金油措辞。
+6. **拒绝套话**:禁止使用『综合表现良好』『有待加强』『具有一定潜力』这种万金油措辞。{no_jd_rule}
 
 ## 报告固定结构(6 段)
 
 ### 1. 基础信息
-- 目标岗位(从 JD 提炼)
+{basic_info_line}
 - 面试等级
 - 综合复盘评级(优秀 / 合格 / 待提升 / 明显不足,四档之一)
 
 ### 2. 六维度详细打分(每分附依据)
-1. 岗位匹配度
+1. {dim1}
 2. 专业技术能力
 3. 项目实战能力
 4. 逻辑思维能力
@@ -285,10 +355,10 @@ def build_report_prompt(
 6. 职级适配度(关键:严格对照 {level} 职级标准)
 
 ### 3. 候选人核心优势
-列出 2-4 条,每条都贴合岗位和职级,引用具体回答。
+{strength_line}
 
 ### 4. 核心短板与知识盲区
-列出 2-4 条,精准指出简历或回答中的薄弱点,避免空话。
+{weakness_line}
 
 ### 5. 针对性提升建议
 分四类:

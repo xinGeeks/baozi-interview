@@ -437,16 +437,21 @@ def _user_friendly_error(e: LLMError) -> str:
 # ============================================================================
 
 
+def _practice_focus() -> str | None:
+    """practice_mode 下返回焦点主题,否则 None。"""
+    if not st.session_state.get("practice_mode"):
+        return None
+    return st.session_state.get("practice_topic") or None
+
+
 def _system_prompt() -> str:
-    focus = (
-        st.session_state.practice_topic
-        if st.session_state.get("practice_mode") else None
-    )
+    focus = _practice_focus()
+    # 专项练习不带 JD:训练方向完全由焦点主题决定,避免残留 JD 串味
     return build_interviewer_system_prompt(
         level=st.session_state.interview_level,
         style=st.session_state.interview_style,
         resume=st.session_state.resume_content,
-        jd=st.session_state.jd_content,
+        jd="" if focus else st.session_state.jd_content,
         focus_context=focus,
     )
 
@@ -642,9 +647,11 @@ def _render_history_view(session_id: str) -> None:
 
 def _aggregate_authenticity() -> AuthenticityReport | None:
     """报告生成时调一次 LLM 聚合启发式 signals → AuthenticityReport。"""
+    _focus = _practice_focus()
     prompt = build_authenticity_judgment_prompt(
         resume=st.session_state.resume_content,
-        jd=st.session_state.jd_content,
+        jd=(f"(专项练习:焦点主题「{_focus}」,无目标岗位)" if _focus
+            else st.session_state.jd_content),
         chat_history=list(st.session_state.chat_history),
         turn_flags=list(st.session_state.turn_authenticity_flags),
     )
@@ -680,12 +687,14 @@ def _generate_report() -> None:
     if not st.session_state.chat_history:
         st.session_state.error_msg = "还没有面试对话,无法生成报告"
         return
+    _focus = _practice_focus()
     prompt = prompts.build_report_prompt(
         level=st.session_state.interview_level,
         resume=st.session_state.resume_content,
-        jd=st.session_state.jd_content,
+        jd="" if _focus else st.session_state.jd_content,
         chat_history=list(st.session_state.chat_history),
         turn_feedback=list(st.session_state.turn_feedback),
+        focus_context=_focus,
     )
     try:
         report = _do_chat([{"role": "user", "content": prompt}], temperature=0.4)
@@ -712,7 +721,10 @@ def _generate_report() -> None:
             db_path=None,
             level=st.session_state.interview_level,
             style=st.session_state.interview_style,
-            jd=st.session_state.jd_content,
+            jd=(
+                f"[专项练习] {_focus}" if _focus
+                else st.session_state.jd_content
+            ),
             resume_text=st.session_state.resume_content,
             chat_history=list(st.session_state.chat_history),
             turn_feedback=list(st.session_state.turn_feedback),

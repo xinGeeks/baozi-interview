@@ -302,3 +302,157 @@ class TestFocusContext:
         )
         assert SINGLE_QUESTION_RULE in prompt
         assert END_SIGNAL in prompt
+
+
+# ============================================================================
+# 专项练习:不需要 JD / 简历 (v0.3.1)
+# ============================================================================
+
+
+class TestPracticeNeedsNoJdOrResume:
+    def test_no_jd_section_when_practice(self):
+        """practice 且无 JD:不应出现『目标岗位 JD』段或『未填写 JD』占位。"""
+        prompt = build_interviewer_system_prompt(
+            level="社招(中级)",
+            style="温和引导",
+            resume="",
+            jd="",
+            focus_context="kafka 高可用",
+        )
+        assert "【目标岗位 JD】" not in prompt
+        assert "(用户未填写 JD)" not in prompt
+        assert "专项练习" in prompt
+
+    def test_no_resume_section_when_practice_without_resume(self):
+        """practice 且无简历:不应出现简历段,也不应出现『仅根据 JD 通用提问』。"""
+        prompt = build_interviewer_system_prompt(
+            level="校招",
+            style="温和引导",
+            resume="",
+            jd="",
+            focus_context="系统设计",
+        )
+        assert "【候选人简历】" not in prompt
+        assert "仅根据 JD 通用提问" not in prompt
+
+    def test_practice_rules_forbid_asking_for_jd_and_resume(self):
+        """核心规则 3/4 应改成禁止索要简历 / 岗位。"""
+        prompt = build_interviewer_system_prompt(
+            level="社招(高级)",
+            style="压力深挖",
+            resume="",
+            jd="",
+            focus_context="Redis 缓存击穿",
+        )
+        assert "禁止索要简历" in prompt
+        assert "禁止询问或假设候选人应聘什么岗位" in prompt
+        assert "严格对齐 JD 要求的技能" not in prompt
+
+    def test_practice_keeps_resume_when_provided(self):
+        """practice 但有简历:简历进 prompt,且标注仅供交叉验证。"""
+        prompt = build_interviewer_system_prompt(
+            level="社招(中级)",
+            style="温和引导",
+            resume="我做过 kafka 集群运维",
+            jd="",
+            focus_context="kafka 高可用",
+        )
+        assert "我做过 kafka 集群运维" in prompt
+        assert "仅供交叉验证" in prompt
+        assert "与简历的交叉验证" in prompt
+
+    def test_practice_ignores_jd_even_if_passed(self):
+        """practice 传了 JD 也不该拼出 JD 考核规则(调用方应传空,双保险)。"""
+        prompt = build_interviewer_system_prompt(
+            level="社招(中级)",
+            style="温和引导",
+            resume="",
+            jd="",
+            focus_context="kafka 高可用",
+        )
+        assert "考核岗位必备技能" not in prompt
+
+    def test_no_duplicate_section_headers(self):
+        """流程标准化 / 开场白 标题各只应出现一次(防 block 自带标题重复)。"""
+        for focus in (None, "kafka 高可用"):
+            prompt = build_interviewer_system_prompt(
+                level="社招(中级)",
+                style="温和引导",
+                resume="",
+                jd="JD" if focus is None else "",
+                focus_context=focus,
+            )
+            assert prompt.count("## 流程标准化") == 1, f"focus={focus}"
+            assert prompt.count("## 开场白") == 1, f"focus={focus}"
+
+    def test_legacy_still_has_jd_and_resume_sections(self):
+        """向后兼容:正常面试仍保留简历段 + JD 段 + 原规则 3/4。"""
+        prompt = build_interviewer_system_prompt(
+            level="社招(中级)",
+            style="温和引导",
+            resume="简历正文",
+            jd="岗位 JD 正文",
+            focus_context=None,
+        )
+        assert "【候选人简历】" in prompt
+        assert "【目标岗位 JD】" in prompt
+        assert "岗位 JD 正文" in prompt
+        assert "严格对齐 JD 要求的技能" in prompt
+
+
+class TestPracticeReportPrompt:
+    def _chat(self):
+        return [
+            {"role": "assistant", "content": "kafka ISR 是什么?"},
+            {"role": "user", "content": "同步副本集合"},
+        ]
+
+    def test_practice_report_has_no_jd_section(self):
+        """practice 复盘:无 JD 段、无『从 JD 提炼』的目标岗位行。"""
+        prompt = build_report_prompt(
+            level="社招(中级)",
+            resume="",
+            jd="",
+            chat_history=self._chat(),
+            focus_context="kafka 高可用",
+        )
+        assert "【目标岗位 JD】" not in prompt
+        assert "目标岗位(从 JD 提炼)" not in prompt
+        assert "练习主题:kafka 高可用" in prompt
+
+    def test_practice_report_swaps_first_dimension(self):
+        """六维第 1 项应换成主题掌握度,不再是岗位匹配度。"""
+        prompt = build_report_prompt(
+            level="社招(中级)",
+            resume="",
+            jd="",
+            chat_history=self._chat(),
+            focus_context="kafka 高可用",
+        )
+        assert "主题掌握度" in prompt
+        assert "1. 岗位匹配度" not in prompt
+        assert "不评岗位匹配" in prompt
+
+    def test_practice_report_keeps_resume_when_provided(self):
+        prompt = build_report_prompt(
+            level="社招(中级)",
+            resume="我做过 kafka 集群运维",
+            jd="",
+            chat_history=self._chat(),
+            focus_context="kafka 高可用",
+        )
+        assert "我做过 kafka 集群运维" in prompt
+        assert "仅供交叉验证" in prompt
+
+    def test_legacy_report_unchanged(self):
+        """向后兼容:不传 focus_context 时 JD 段 + 岗位匹配度维度都在。"""
+        prompt = build_report_prompt(
+            level="社招(中级)",
+            resume="简历",
+            jd="岗位 JD",
+            chat_history=self._chat(),
+        )
+        assert "【目标岗位 JD】" in prompt
+        assert "1. 岗位匹配度" in prompt
+        assert "目标岗位(从 JD 提炼)" in prompt
+        assert "不评岗位匹配" not in prompt

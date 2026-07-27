@@ -23,8 +23,9 @@ st.session_state.current_page = "practice"
 
 st.title("🎯 专项练习")
 st.caption(
-    "围绕一个具体主题深挖,不需要 JD。例:kafka 高可用、Redis 缓存击穿、"
-    "系统设计能力。面试官首题直接切入主题,不做自我介绍开场。"
+    "围绕一个具体主题深挖,不需要 JD、不需要简历。"
+    "例:kafka 高可用、Redis 缓存击穿、系统设计能力。"
+    "面试官首题直接切入主题,不做自我介绍开场。"
 )
 
 # ---- 焦点主题 ----
@@ -46,11 +47,11 @@ with col_s:
 
 if st.session_state.resume_content:
     st.caption(
-        f"📄 将复用已上传简历 ({len(st.session_state.resume_content)} 字)"
-        "做交叉验证提问"
+        f"📄 已上传简历 ({len(st.session_state.resume_content)} 字):"
+        "会顺手做主题与项目经历的交叉验证(非必需)"
     )
 else:
-    st.caption("📄 未上传简历,仅围绕主题通用提问(可到『配置』页上传)")
+    st.caption("📄 无需简历、无需 JD:只围绕焦点主题提问")
 
 # ---- LLM 配置 / 预算 ----
 st.divider()

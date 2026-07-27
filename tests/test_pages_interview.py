@@ -560,3 +560,95 @@ class TestPracticeMode:
                 ).fetchall()
             ]
         assert modes == ["practice"], f"应落一条 practice session,实际: {modes}"
+
+
+# ============================================================================
+# 专项练习不带 JD / 简历 (v0.3.1)
+# ============================================================================
+
+
+class TestPracticeDropsJd:
+    def test_system_prompt_gets_empty_jd_in_practice(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """即使 session 里残留 JD,practice 模式也应以空 JD + focus 构造 prompt。"""
+        captured = {}
+
+        def fake_sys_prompt(**kwargs):
+            captured.update(kwargs)
+            return "SYS_PROMPT_STUB"
+
+        monkeypatch.setattr(
+            "interview_helpers.build_interviewer_system_prompt", fake_sys_prompt
+        )
+
+        at = _interview(
+            tmp_path / "test.db",
+            interview_started=False,
+            jd_content="残留的旧 JD 正文",
+            mock_responses=["kafka 的 ISR 机制是怎么保证高可用的?"],
+        )
+        at.session_state["practice_mode"] = True
+        at.session_state["practice_topic"] = "kafka 高可用"
+        at.session_state["pending_start"] = True
+        at.run()
+
+        assert captured.get("focus_context") == "kafka 高可用"
+        assert captured.get("jd") == "", (
+            f"practice 不应带 JD,实际: {captured.get('jd')!r}"
+        )
+
+    def test_report_prompt_gets_focus_and_empty_jd_in_practice(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """practice 复盘应带 focus_context 且不带 JD。"""
+        captured = {}
+
+        def fake_report_prompt(*args, **kwargs):
+            captured.update(kwargs)
+            return "REPORT_PROMPT_STUB"
+
+        monkeypatch.setattr("prompts.build_report_prompt", fake_report_prompt)
+
+        at = _interview(
+            tmp_path / "test.db",
+            jd_content="残留的旧 JD 正文",
+            chat_history=[
+                {"role": "assistant", "content": "kafka ISR 是什么?"},
+                {"role": "user", "content": "同步副本集合"},
+            ],
+            turn_feedback=[{"question": "kafka ISR", "score": 7, "advice": "补细节"}],
+            mock_responses=["## 练习复盘"],
+            timeout=120,
+        )
+        at.session_state["practice_mode"] = True
+        at.session_state["practice_topic"] = "kafka 高可用"
+        at.run()
+        _button_by_label(at, "退出专项练习").click().run()
+
+        assert captured.get("focus_context") == "kafka 高可用"
+        assert captured.get("jd") == ""
+
+    def test_normal_mode_still_passes_jd(self, tmp_path: Path, monkeypatch):
+        """向后兼容:正常面试仍把 JD 传进 system prompt,focus_context 为 None。"""
+        captured = {}
+
+        def fake_sys_prompt(**kwargs):
+            captured.update(kwargs)
+            return "SYS_PROMPT_STUB"
+
+        monkeypatch.setattr(
+            "interview_helpers.build_interviewer_system_prompt", fake_sys_prompt
+        )
+
+        at = _interview(
+            tmp_path / "test.db",
+            interview_started=False,
+            jd_content="Python 后端开发",
+            mock_responses=["请简单介绍一下你自己"],
+        )
+        at.session_state["pending_start"] = True
+        at.run()
+
+        assert captured.get("jd") == "Python 后端开发"
+        assert captured.get("focus_context") is None
